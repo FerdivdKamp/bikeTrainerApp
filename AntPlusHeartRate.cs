@@ -1,11 +1,12 @@
+using SmallEarthTech.AntPlus;
+using SmallEarthTech.AntPlus.DeviceProfiles;
 using System;
 using System.Collections.Specialized;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using SmallEarthTech.AntPlus;
-using SmallEarthTech.AntPlus.DeviceProfiles;
 
 public sealed class AntPlusHeartRate : IHeartRateSensor
 {
@@ -18,23 +19,27 @@ public sealed class AntPlusHeartRate : IHeartRateSensor
     {
         _devices = devices;
 
-        // When new devices are discovered, this event fires.
+        Debug.WriteLine("[ANT] AntPlusHeartRate created");
+
         _devices.CollectionChanged += Devices_CollectionChanged;
 
-        // Try immediately, in case the strap is already seen.
+        // In case devices already exist when we start
         TryAttachHeartRate();
     }
 
     public Task ConnectAsync(CancellationToken ct = default)
     {
-        // Creating AntDeviceCollection already started scan mode.
-        // Just make sure we’re attached to a HRM if one exists.
+        Debug.WriteLine("[ANT] ConnectAsync called");
+
+        // AntDeviceCollection constructor already put radio in scan mode.
         TryAttachHeartRate();
         return Task.CompletedTask;
     }
 
     public Task DisconnectAsync()
     {
+        Debug.WriteLine("[ANT] DisconnectAsync called");
+
         if (_hrm != null)
         {
             _hrm.PropertyChanged -= Hrm_PropertyChanged;
@@ -43,39 +48,58 @@ public sealed class AntPlusHeartRate : IHeartRateSensor
         return Task.CompletedTask;
     }
 
-    // ---- internal plumbing ----
-
     private void Devices_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
-        if (_hrm != null)
-            return; // already attached
+        Debug.WriteLine($"[ANT] CollectionChanged: action={e.Action}, total devices={_devices.Count}");
 
-        TryAttachHeartRate();
+        foreach (var d in _devices)
+        {
+            Debug.WriteLine($"[ANT]  device: {d.GetType().FullName}  ToString()={d}");
+        }
+
+        if (_hrm == null)
+        {
+            TryAttachHeartRate();
+        }
     }
 
     private void TryAttachHeartRate()
     {
-        // Find the first HeartRate device, if any
+        Debug.WriteLine($"[ANT] TryAttachHeartRate: current device count = {_devices.Count}");
+
         var hr = _devices.OfType<HeartRate>().FirstOrDefault();
-        if (hr == null || ReferenceEquals(hr, _hrm))
+        if (hr == null)
+        {
+            Debug.WriteLine("[ANT]   no HeartRate device found yet");
             return;
+        }
+
+        if (ReferenceEquals(hr, _hrm))
+        {
+            Debug.WriteLine("[ANT]   HeartRate device already attached");
+            return;
+        }
 
         if (_hrm != null)
+        {
             _hrm.PropertyChanged -= Hrm_PropertyChanged;
+        }
 
         _hrm = hr;
         _hrm.PropertyChanged += Hrm_PropertyChanged;
+
+        Debug.WriteLine($"[ANT]   Attached to HeartRate device: {_hrm}");
     }
 
     private void Hrm_PropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (_hrm == null)
-            return;
+        if (_hrm == null) return;
 
-        // HeartRateData is a struct with ComputedHeartRate BPM.
         if (e.PropertyName == nameof(HeartRate.HeartRateData))
         {
             var bpm = _hrm.HeartRateData.ComputedHeartRate;
+            Debug.WriteLine($"[ANT] HeartRateData changed – BPM={bpm}");
+
             if (bpm > 0)
             {
                 HeartRateUpdated?.Invoke(this, bpm);
