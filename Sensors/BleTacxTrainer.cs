@@ -346,85 +346,217 @@ namespace ErgTrainer.Sensors
             // Cycling Power Measurement typically starts with flags, FTMS has different structure
             if (data.Length < 2) return null;
 
-            // Try to detect which service we're using based on characteristic UUID
-            // For now, try FTMS format first, then Cycling Power
-            return ParseFtmsData(data) ?? ParseCyclingPowerData(data);
+            // Detect format based on data structure:
+            // FTMS: single byte flag (0x03, 0x07, etc. - typically < 0x10 for first byte)
+            // Cycling Power: 2-byte flags (typically 0x0000-0xFFFF, but often starts with 0x00XX or 0xXX00)
+            bool looksLikeFtms = data[0] < 0x20; // FTMS flags are typically small values
+            
+            TrainerData? ftmsResult = null;
+            TrainerData? cyclingPowerResult = null;
+            
+            if (looksLikeFtms)
+            {
+                // Try FTMS first (most common for Tacx Neo)
+                Debug.WriteLine("[Tacx] Data looks like FTMS format, parsing as FTMS");
+                ftmsResult = ParseFtmsData(data);
+                if (ftmsResult != null && (ftmsResult.SpeedKph > 0 || ftmsResult.PowerWatts > 0 || ftmsResult.CadenceRpm > 0))
+                {
+                    Debug.WriteLine($"[Tacx] Using FTMS result: Speed={ftmsResult.SpeedKph:F2}kph, Cadence={ftmsResult.CadenceRpm:F1}rpm, Power={ftmsResult.PowerWatts:F0}W");
+                    return ftmsResult;
+                }
+            }
+            
+            // Fall back to Cycling Power format
+            Debug.WriteLine("[Tacx] Trying Cycling Power Service format");
+            cyclingPowerResult = ParseCyclingPowerData(data);
+            if (cyclingPowerResult != null && (cyclingPowerResult.SpeedKph > 0 || cyclingPowerResult.PowerWatts > 0 || cyclingPowerResult.CadenceRpm > 0))
+            {
+                Debug.WriteLine($"[Tacx] Using Cycling Power result: Speed={cyclingPowerResult.SpeedKph:F2}kph, Cadence={cyclingPowerResult.CadenceRpm:F1}rpm, Power={cyclingPowerResult.PowerWatts:F0}W");
+                return cyclingPowerResult;
+            }
+            
+            // If FTMS wasn't tried yet, try it now
+            if (!looksLikeFtms)
+            {
+                Debug.WriteLine("[Tacx] Also trying FTMS format");
+                ftmsResult = ParseFtmsData(data);
+                if (ftmsResult != null && (ftmsResult.SpeedKph > 0 || ftmsResult.PowerWatts > 0 || ftmsResult.CadenceRpm > 0))
+                {
+                    Debug.WriteLine($"[Tacx] Using FTMS result: Speed={ftmsResult.SpeedKph:F2}kph, Cadence={ftmsResult.CadenceRpm:F1}rpm, Power={ftmsResult.PowerWatts:F0}W");
+                    return ftmsResult;
+                }
+            }
+
+            // Return whichever gave us at least some data
+            return ftmsResult ?? cyclingPowerResult;
         }
 
         private TrainerData? ParseFtmsData(byte[] data)
         {
-            // Simplified FTMS Indoor Bike Data parser
-            // Full implementation would parse all flags and fields according to FTMS spec
+            // FTMS Indoor Bike Data parser
+            // According to Bluetooth SIG FTMS specification:
+            // Format: Flags (1 byte) + [optional fields in specific order based on flags]
+            // Field order when present:
+            // 1. Instantaneous Speed (if More Data flag is set)
+            // 2. Average Speed (if Average Speed Present flag is set)
+            // 3. Instantaneous Cadence (if Instantaneous Cadence Present flag is set)
+            // 4. Average Cadence (if Average Cadence Present flag is set)
+            // 5. Total Distance (if Total Distance Present flag is set)
+            // 6. Resistance Level (if Resistance Level Present flag is set)
+            // 7. Instantaneous Power (if Instantaneous Power Present flag is set)
+            // 8. Average Power (if Average Power Present flag is set)
             if (data.Length < 2) return null;
 
             // Flags byte
             byte flags = data[0];
-            bool moreData = (flags & 0x01) != 0;
-            bool averageSpeedPresent = (flags & 0x02) != 0;
-            bool instantaneousCadencePresent = (flags & 0x04) != 0;
-            bool averageCadencePresent = (flags & 0x08) != 0;
-            bool totalDistancePresent = (flags & 0x10) != 0;
-            bool resistanceLevelPresent = (flags & 0x20) != 0;
-            bool instantaneousPowerPresent = (flags & 0x40) != 0;
-            bool averagePowerPresent = (flags & 0x80) != 0;
+            bool moreData = (flags & 0x01) != 0;  // Bit 0: More Data (Instantaneous Speed)
+            bool averageSpeedPresent = (flags & 0x02) != 0;  // Bit 1: Average Speed Present
+            bool instantaneousCadencePresent = (flags & 0x04) != 0;  // Bit 2: Instantaneous Cadence Present
+            bool averageCadencePresent = (flags & 0x08) != 0;  // Bit 3: Average Cadence Present
+            bool totalDistancePresent = (flags & 0x10) != 0;  // Bit 4: Total Distance Present
+            bool resistanceLevelPresent = (flags & 0x20) != 0;  // Bit 5: Resistance Level Present
+            bool instantaneousPowerPresent = (flags & 0x40) != 0;  // Bit 6: Instantaneous Power Present
+            bool averagePowerPresent = (flags & 0x80) != 0;  // Bit 7: Average Power Present
+
+            Debug.WriteLine($"[Tacx] FTMS Flags: 0x{flags:X2} - moreData={moreData}, avgSpeed={averageSpeedPresent}, instCad={instantaneousCadencePresent}, instPower={instantaneousPowerPresent}, dataLength={data.Length}");
+            Debug.WriteLine($"[Tacx] FTMS Raw data: {BitConverter.ToString(data)}");
 
             int offset = 1;
             double speedKph = 0;
             double cadenceRpm = 0;
             double powerWatts = 0;
 
-            // Instantaneous Speed (if present)
+            // Parse fields in the correct order according to FTMS specification
+            // 1. Instantaneous Speed (if More Data flag is set)
             if (moreData && data.Length >= offset + 2)
             {
                 ushort speed = BitConverter.ToUInt16(data, offset);
                 speedKph = speed * 0.01; // Speed in km/h with resolution 0.01
+                Debug.WriteLine($"[Tacx] Instantaneous Speed @{offset}: {speed} -> {speedKph:F2} kph");
                 offset += 2;
             }
 
-            // Average Speed (if present)
+            // 2. Average Speed (if Average Speed Present flag is set)
             if (averageSpeedPresent && data.Length >= offset + 2)
             {
+                // Skip average speed - we use instantaneous speed
                 offset += 2;
+                Debug.WriteLine($"[Tacx] Average Speed skipped @{offset - 2}");
             }
 
-            // Instantaneous Cadence (if present)
+            // 3. Instantaneous Cadence (if Instantaneous Cadence Present flag is set)
             if (instantaneousCadencePresent && data.Length >= offset + 2)
             {
                 ushort cadence = BitConverter.ToUInt16(data, offset);
                 cadenceRpm = cadence * 0.5; // Cadence in rpm with resolution 0.5
+                Debug.WriteLine($"[Tacx] Instantaneous Cadence @{offset}: {cadence} -> {cadenceRpm:F1} rpm");
                 offset += 2;
             }
 
-            // Average Cadence (if present)
+            // 4. Average Cadence (if Average Cadence Present flag is set)
             if (averageCadencePresent && data.Length >= offset + 2)
             {
+                // Skip average cadence - we use instantaneous cadence
                 offset += 2;
+                Debug.WriteLine($"[Tacx] Average Cadence skipped @{offset - 2}");
             }
 
-            // Total Distance (if present)
+            // 5. Total Distance (if Total Distance Present flag is set) - 3 bytes
             if (totalDistancePresent && data.Length >= offset + 3)
             {
                 offset += 3;
+                Debug.WriteLine($"[Tacx] Total Distance skipped @{offset - 3}");
             }
 
-            // Resistance Level (if present)
+            // 6. Resistance Level (if Resistance Level Present flag is set)
             if (resistanceLevelPresent && data.Length >= offset + 2)
             {
                 offset += 2;
+                Debug.WriteLine($"[Tacx] Resistance Level skipped @{offset - 2}");
             }
 
-            // Instantaneous Power (if present)
+            // 7. Instantaneous Power (if Instantaneous Power Present flag is set)
             if (instantaneousPowerPresent && data.Length >= offset + 2)
             {
                 short power = BitConverter.ToInt16(data, offset);
-                powerWatts = power; // Power in watts
+                powerWatts = power; // Power in watts (signed 16-bit)
+                Debug.WriteLine($"[Tacx] Instantaneous Power @{offset}: {power} -> {powerWatts:F0} W");
                 offset += 2;
             }
 
-            // Average Power (if present)
+            // 8. Average Power (if Average Power Present flag is set)
             if (averagePowerPresent && data.Length >= offset + 2)
             {
+                // Skip average power - we use instantaneous power
                 offset += 2;
+                Debug.WriteLine($"[Tacx] Average Power skipped @{offset - 2}");
+            }
+            
+            // Note: Tacx may send data even when flags don't indicate it's present
+            // If we have more data than expected based on flags, try to find cadence and power
+            // This handles cases where Tacx sends data in a non-standard way
+            
+            // If cadence and power are still 0, but we have extra data, try to find them
+            // Based on observed data: 03-00-02-00-35-01-00-00-28-0A-3C-00-00-F0
+            // Speed at 1-2, avg speed at 3-4, then there's more data
+            // After speed fields, offset should be 5, so try cadence/power from there
+            if ((cadenceRpm == 0 || powerWatts == 0) && data.Length > offset)
+            {
+                int remainingBytes = data.Length - offset;
+                Debug.WriteLine($"[Tacx] Flags don't indicate cadence/power, but {remainingBytes} bytes remain (offset={offset}). Trying to find them...");
+                
+                // Try cadence at various positions after the parsed fields
+                // Common positions: offset 5-6, 7-8, 9-10
+                if (cadenceRpm == 0)
+                {
+                    for (int cadOffset = offset; cadOffset <= offset + 6 && cadOffset + 2 <= data.Length; cadOffset += 2)
+                    {
+                        ushort cadence = BitConverter.ToUInt16(data, cadOffset);
+                        double testCadence = cadence * 0.5;
+                        
+                        // Accept reasonable cadence values (5-200 rpm)
+                        if (testCadence >= 5 && testCadence < 200)
+                        {
+                            cadenceRpm = testCadence;
+                            Debug.WriteLine($"[Tacx] Cadence found @{cadOffset}: {cadence} -> {cadenceRpm:F1} rpm");
+                            break;
+                        }
+                        else
+                        {
+                            Debug.WriteLine($"[Tacx] Cadence @{cadOffset}: {cadence} (*0.5 = {testCadence:F1} rpm, rejected)");
+                        }
+                    }
+                }
+                
+                // Try power at various positions
+                // Common positions: offset 9-10, 11-12
+                if (powerWatts == 0)
+                {
+                    for (int powOffset = offset + 4; powOffset <= offset + 8 && powOffset + 2 <= data.Length; powOffset += 2)
+                    {
+                        ushort powerRaw = BitConverter.ToUInt16(data, powOffset);
+                        short powerSigned = BitConverter.ToInt16(data, powOffset);
+                        
+                        // Try signed first (FTMS uses signed for power)
+                        if (powerSigned >= 5 && powerSigned < 2000)
+                        {
+                            powerWatts = powerSigned;
+                            Debug.WriteLine($"[Tacx] Power found @{powOffset} (signed): {powerSigned} -> {powerWatts:F0} W");
+                            break;
+                        }
+                        // Try unsigned
+                        else if (powerRaw >= 5 && powerRaw < 2000)
+                        {
+                            powerWatts = powerRaw;
+                            Debug.WriteLine($"[Tacx] Power found @{powOffset} (unsigned): {powerRaw} -> {powerWatts:F0} W");
+                            break;
+                        }
+                        else
+                        {
+                            Debug.WriteLine($"[Tacx] Power @{powOffset}: {powerRaw}/{powerSigned} (rejected)");
+                        }
+                    }
+                }
             }
 
             return new TrainerData(

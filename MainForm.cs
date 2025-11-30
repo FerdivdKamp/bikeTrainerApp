@@ -1,9 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using ErgTrainer.Controls;
 using ErgTrainer.Sensors;
 using InTheHand.Bluetooth;
 
@@ -31,13 +33,23 @@ namespace ErgTrainer
         private readonly Label _lblHrmStatus;
         private readonly Label _lblHeartRate;
 
+        // Charts Section
+        private readonly GroupBox _grpCharts;
+        private readonly TimeSeriesChart _chartPower;
+        private readonly TimeSeriesChart _chartCadence;
+        private readonly TimeSeriesChart _chartSpeed;
+
+        // Timer Section
+        private readonly GroupBox _grpTimer;
+        private readonly TrainingTimerControl _trainingTimer;
+
         private List<BluetoothDevice> _availableDevices = new List<BluetoothDevice>();
 
         public MainForm()
         {
             Text = "ergtrainer – Tacx Trainer + HRM";
-            Width = 1050;
-            Height = 500;
+            Width = 1400;
+            Height = 900;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
 
@@ -164,11 +176,75 @@ namespace ErgTrainer
                 _lblHeartRate
             });
 
+            // Charts Section
+            _grpCharts = new GroupBox
+            {
+                Text = "Training Data",
+                Left = 690,
+                Top = 20,
+                Width = 680,
+                Height = 840
+            };
+
+            _chartPower = new TimeSeriesChart("Power", "W", Color.Red)
+            {
+                Left = 10,
+                Top = 25,
+                Width = 660,
+                Height = 260
+            };
+
+            _chartCadence = new TimeSeriesChart("Cadence", "rpm", Color.Blue)
+            {
+                Left = 10,
+                Top = 295,
+                Width = 660,
+                Height = 260
+            };
+
+            _chartSpeed = new TimeSeriesChart("Speed", "kph", Color.Green)
+            {
+                Left = 10,
+                Top = 565,
+                Width = 660,
+                Height = 260
+            };
+
+            _grpCharts.Controls.AddRange(new Control[]
+            {
+                _chartPower,
+                _chartCadence,
+                _chartSpeed
+            });
+
+            // Timer Section
+            _grpTimer = new GroupBox
+            {
+                Text = "Training Timer",
+                Left = 340,
+                Top = 460,
+                Width = 330,
+                Height = 120
+            };
+
+            _trainingTimer = new TrainingTimerControl
+            {
+                Left = 10,
+                Top = 25
+            };
+            _trainingTimer.Started += TrainingTimer_Started;
+            _trainingTimer.Paused += TrainingTimer_Paused;
+            _trainingTimer.Stopped += TrainingTimer_Stopped;
+
+            _grpTimer.Controls.Add(_trainingTimer);
+
             Controls.AddRange(new Control[]
             {
                 _grpDevices,
                 _grpTacx,
-                _grpHrm
+                _grpHrm,
+                _grpCharts,
+                _grpTimer
             });
 
             // Event handlers
@@ -263,6 +339,9 @@ namespace ErgTrainer
                     _lblTacxStatus.Text = $"Status: connected to {device.Name ?? "trainer"}";
                     _btnDisconnectTacx.Enabled = true;
                     _lblTacxData.Text = "Power: -- W | Cadence: -- rpm | Speed: -- kph";
+                    
+                    // Don't start chart recording automatically - wait for timer start
+                    
                     // Remove device from list when connected
                     int index = _availableDevices.IndexOf(device);
                     if (index >= 0)
@@ -289,6 +368,11 @@ namespace ErgTrainer
             _lblTacxStatus.Text = "Status: trainer disconnected";
             _btnDisconnectTacx.Enabled = false;
             _lblTacxData.Text = "Power: -- W | Cadence: -- rpm | Speed: -- kph";
+            
+            // Stop chart recording
+            _chartPower.StopRecording();
+            _chartCadence.StopRecording();
+            _chartSpeed.StopRecording();
         }
 
         private void TacxTrainer_DataUpdated(object? sender, TrainerData data)
@@ -300,6 +384,15 @@ namespace ErgTrainer
             }
 
             _lblTacxData.Text = $"Power: {data.PowerWatts:F0} W | Cadence: {data.CadenceRpm:F0} rpm | Speed: {data.SpeedKph:F1} kph";
+            
+            // Only update charts if timer is running and not paused
+            if (_trainingTimer.IsRunning)
+            {
+                var timestamp = DateTime.Now;
+                _chartPower.AddDataPoint(data.PowerWatts, timestamp);
+                _chartCadence.AddDataPoint(data.CadenceRpm, timestamp);
+                _chartSpeed.AddDataPoint(data.SpeedKph, timestamp);
+            }
         }
 
         #endregion
@@ -359,9 +452,38 @@ namespace ErgTrainer
 
         #endregion
 
+        #region Timer Methods
+
+        private void TrainingTimer_Started(object? sender, EventArgs e)
+        {
+            // Start chart recording when timer starts (only if not resuming from pause)
+            if (!_chartPower.IsRecording)
+            {
+                _chartPower.StartRecording();
+                _chartCadence.StartRecording();
+                _chartSpeed.StartRecording();
+            }
+        }
+
+        private void TrainingTimer_Paused(object? sender, EventArgs e)
+        {
+            // Charts will stop updating automatically since IsRunning returns false
+        }
+
+        private void TrainingTimer_Stopped(object? sender, EventArgs e)
+        {
+            // Stop chart recording
+            _chartPower.StopRecording();
+            _chartCadence.StopRecording();
+            _chartSpeed.StopRecording();
+        }
+
+        #endregion
+
         protected override async void OnFormClosed(FormClosedEventArgs e)
         {
             base.OnFormClosed(e);
+            
             await _tacxTrainer.DisconnectAsync();
             await _hrmSensor.DisconnectAsync();
         }
