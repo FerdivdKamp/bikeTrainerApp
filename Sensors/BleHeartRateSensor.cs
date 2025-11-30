@@ -78,9 +78,35 @@ namespace ErgTrainer.Sensors
 
             try
             {
+                // Get GATT instance - handle disposed object
                 var gatt = device.Gatt;
+                
+                // Try to connect without disconnecting first (disconnect might dispose it)
                 Debug.WriteLine("[BLE] Connecting GATT to check services…");
-                await gatt.ConnectAsync();
+                try
+                {
+                    await gatt.ConnectAsync();
+                }
+                catch (ObjectDisposedException)
+                {
+                    Debug.WriteLine("[BLE] GATT was disposed during ConnectAsync");
+                    // Try to get a fresh GATT instance
+                    try
+                    {
+                        gatt = device.Gatt;
+                        await gatt.ConnectAsync();
+                    }
+                    catch
+                    {
+                        Debug.WriteLine("[BLE] Failed to get fresh GATT instance");
+                        return false;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[BLE] ConnectAsync failed: {ex.Message}");
+                    return false;
+                }
                 Debug.WriteLine("[BLE] GATT connected.");
 
                 Debug.WriteLine("[BLE] Checking for HeartRate service…");
