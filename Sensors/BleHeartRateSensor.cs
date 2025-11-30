@@ -34,43 +34,13 @@ namespace ErgTrainer.Sensors
 
         public async Task<bool> ConnectAsync(CancellationToken cancellationToken = default)
         {
-            Debug.WriteLine("[BLE] ConnectAsync: starting");
+            Debug.WriteLine("[BLE] ConnectAsync: starting - scanning for devices...");
 
-            bool available;
-            try
+            var devices = await BluetoothDeviceScanner.ScanForDevicesAsync(cancellationToken);
+            if (devices.Count == 0)
             {
-                Debug.WriteLine("[BLE] Checking availability…");
-                available = await Bluetooth.GetAvailabilityAsync();
-                Debug.WriteLine($"[BLE] Availability = {available}");
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"[BLE] GetAvailabilityAsync failed: {ex}");
+                Debug.WriteLine("[BLE] No devices found.");
                 return false;
-            }
-
-            if (!available)
-            {
-                Debug.WriteLine("[BLE] Bluetooth not available – aborting.");
-                return false;
-            }
-
-            Debug.WriteLine("[BLE] Scanning for devices…");
-            IReadOnlyCollection<BluetoothDevice> devices;
-            try
-            {
-                devices = await Bluetooth.ScanForDevicesAsync();
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"[BLE] ScanForDevicesAsync failed: {ex}");
-                return false;
-            }
-
-            Debug.WriteLine($"[BLE] Scan finished. Found {devices.Count} device(s).");
-            foreach (var d in devices)
-            {
-                Debug.WriteLine($"[BLE]   Device: Name='{d.Name}', Id='{d.Id}'");
             }
 
             _device = devices
@@ -89,12 +59,101 @@ namespace ErgTrainer.Sensors
                 return false;
             }
 
-            Debug.WriteLine($"[BLE] Using device: Name='{_device.Name}', Id='{_device.Id}'");
+            return await ConnectToDeviceAsync(_device, cancellationToken);
+        }
+
+        /// <summary>
+        /// Checks if a device is a heart rate monitor by attempting to connect and checking for the Heart Rate service.
+        /// Note: Leaves the connection open for the actual ConnectToDeviceAsync to use.
+        /// </summary>
+        public static async Task<bool> IsHeartRateMonitorAsync(BluetoothDevice device, CancellationToken cancellationToken = default)
+        {
+            if (device == null)
+            {
+                Debug.WriteLine("[BLE] IsHeartRateMonitorAsync: device is null");
+                return false;
+            }
+
+            Debug.WriteLine($"[BLE] IsHeartRateMonitorAsync: checking device Name='{device.Name}', Id='{device.Id}'");
+
+            try
+            {
+                var gatt = device.Gatt;
+                Debug.WriteLine("[BLE] Connecting GATT to check services…");
+                await gatt.ConnectAsync();
+                Debug.WriteLine("[BLE] GATT connected.");
+
+                Debug.WriteLine("[BLE] Checking for HeartRate service…");
+                var hrService = await gatt.GetPrimaryServiceAsync(HeartRateServiceUuid);
+
+                if (hrService != null)
+                {
+                    Debug.WriteLine("[BLE] Device is a heart rate monitor.");
+                    // Don't disconnect - leave connection open for ConnectToDeviceAsync to use
+                    return true;
+                }
+                else
+                {
+                    Debug.WriteLine("[BLE] Device does not have HeartRate service.");
+                    // Disconnect only if it's not a HRM
+                    try
+                    {
+                        gatt.Disconnect();
+                    }
+                    catch { }
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[BLE] IsHeartRateMonitorAsync failed: {ex.Message}");
+                // Try to disconnect if we connected
+                try
+                {
+                    device.Gatt.Disconnect();
+                }
+                catch { }
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Connects to a specific Bluetooth device.
+        /// </summary>
+        public async Task<bool> ConnectToDeviceAsync(BluetoothDevice device, CancellationToken cancellationToken = default)
+        {
+            if (device == null)
+            {
+                Debug.WriteLine("[BLE] ConnectToDeviceAsync: device is null");
+                return false;
+            }
+
+            Debug.WriteLine($"[BLE] ConnectToDeviceAsync: connecting to device Name='{device.Name}', Id='{device.Id}'");
+
+            _device = device;
 
             var gatt = _device.Gatt;
-            Debug.WriteLine("[BLE] Connecting GATT…");
-            await gatt.ConnectAsync();
-            Debug.WriteLine("[BLE] GATT connected.");
+            
+            // Try to connect (might already be connected from IsHeartRateMonitorAsync)
+            try
+            {
+                Debug.WriteLine("[BLE] Connecting GATT…");
+                await gatt.ConnectAsync();
+                Debug.WriteLine("[BLE] GATT connected.");
+            }
+            catch (ObjectDisposedException)
+            {
+                // GATT object was disposed, get a new one
+                Debug.WriteLine("[BLE] GATT was disposed, getting new GATT instance…");
+                gatt = _device.Gatt;
+                await gatt.ConnectAsync();
+                Debug.WriteLine("[BLE] GATT connected (new instance).");
+            }
+            catch (Exception ex)
+            {
+                // If already connected or other error, log and try to continue
+                Debug.WriteLine($"[BLE] GATT connection attempt: {ex.Message} - continuing anyway");
+            }
 
             Debug.WriteLine("[BLE] Getting HeartRate service…");
             _hrService = await gatt.GetPrimaryServiceAsync(HeartRateServiceUuid);
@@ -127,7 +186,7 @@ namespace ErgTrainer.Sensors
             _pollingCts = new CancellationTokenSource();
             _ = Task.Run(() => PollLoopAsync(_pollingCts.Token), _pollingCts.Token);
 
-            Debug.WriteLine("[BLE] ConnectAsync: success");
+            Debug.WriteLine("[BLE] ConnectToDeviceAsync: success");
             return true;
         }
 
