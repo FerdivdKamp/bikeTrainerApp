@@ -1,10 +1,11 @@
-﻿using System;
+﻿using ErgTrainer.Sensors;
+using InTheHand.Bluetooth;
+using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using ErgTrainer.Sensors;
-using InTheHand.Bluetooth;
 
 namespace ErgTrainer.Sensors
 {
@@ -33,69 +34,100 @@ namespace ErgTrainer.Sensors
 
         public async Task<bool> ConnectAsync(CancellationToken cancellationToken = default)
         {
+            Debug.WriteLine("[BLE] ConnectAsync: starting");
+
             bool available;
-
-            Debug.WriteLine("Trying to connect.");
-
             try
             {
-                // 1) Check if Bluetooth is available
+                Debug.WriteLine("[BLE] Checking availability…");
                 available = await Bluetooth.GetAvailabilityAsync();
+                Debug.WriteLine($"[BLE] Availability = {available}");
             }
             catch (Exception ex)
             {
-                // Log and gracefully fail
-                System.Diagnostics.Debug.WriteLine($"[BLE] GetAvailabilityAsync failed: {ex}");
-                return false; // or set a flag and show "BLE not supported" in UI
+                Debug.WriteLine($"[BLE] GetAvailabilityAsync failed: {ex}");
+                return false;
             }
 
             if (!available)
+            {
+                Debug.WriteLine("[BLE] Bluetooth not available – aborting.");
                 return false;
+            }
 
-            // 2) Scan for devices
-            var devices = await Bluetooth.ScanForDevicesAsync(); // may take ~30s default timeout
+            Debug.WriteLine("[BLE] Scanning for devices…");
+            IReadOnlyCollection<BluetoothDevice> devices;
+            try
+            {
+                devices = await Bluetooth.ScanForDevicesAsync();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[BLE] ScanForDevicesAsync failed: {ex}");
+                return false;
+            }
 
-            // Try to pick a sensible device: first whose name starts with HRM, otherwise first with HR service
+            Debug.WriteLine($"[BLE] Scan finished. Found {devices.Count} device(s).");
+            foreach (var d in devices)
+            {
+                Debug.WriteLine($"[BLE]   Device: Name='{d.Name}', Id='{d.Id}'");
+            }
+
             _device = devices
                 .FirstOrDefault(d => !string.IsNullOrEmpty(d.Name) &&
                                      d.Name.StartsWith(TargetNamePrefix, StringComparison.OrdinalIgnoreCase));
 
             if (_device == null)
             {
-                // Fallback: just pick first device; user can refine this later
+                Debug.WriteLine("[BLE] No device with HRM* name found, falling back to first device.");
                 _device = devices.FirstOrDefault();
             }
 
             if (_device == null)
+            {
+                Debug.WriteLine("[BLE] Still no device – aborting.");
                 return false;
+            }
 
-            // 3) Connect GATT
+            Debug.WriteLine($"[BLE] Using device: Name='{_device.Name}', Id='{_device.Id}'");
+
             var gatt = _device.Gatt;
+            Debug.WriteLine("[BLE] Connecting GATT…");
             await gatt.ConnectAsync();
+            Debug.WriteLine("[BLE] GATT connected.");
 
-            // 4) Get heart-rate service + measurement characteristic
+            Debug.WriteLine("[BLE] Getting HeartRate service…");
             _hrService = await gatt.GetPrimaryServiceAsync(HeartRateServiceUuid);
             if (_hrService == null)
+            {
+                Debug.WriteLine("[BLE] HeartRate service not found.");
                 return false;
+            }
 
+            Debug.WriteLine("[BLE] Getting HeartRate measurement characteristic…");
             _hrCharacteristic = await _hrService.GetCharacteristicAsync(HeartRateMeasurementUuid);
             if (_hrCharacteristic == null)
+            {
+                Debug.WriteLine("[BLE] HeartRate characteristic not found.");
                 return false;
+            }
 
-            // 5) Start notifications if supported (non-blocking)
+            Debug.WriteLine("[BLE] Starting notifications (if supported)...");
             try
             {
                 await _hrCharacteristic.StartNotificationsAsync();
+                Debug.WriteLine("[BLE] Notifications started.");
             }
-            catch
+            catch (Exception ex)
             {
-                // Not all platforms require/implement this; ignore if it fails
+                Debug.WriteLine($"[BLE] StartNotificationsAsync failed (ignored): {ex.Message}");
             }
 
-            // 6) Start a background polling loop that reads HR once per second
+            Debug.WriteLine("[BLE] Starting polling loop…");
             _pollingCts = new CancellationTokenSource();
             _ = Task.Run(() => PollLoopAsync(_pollingCts.Token), _pollingCts.Token);
 
+            Debug.WriteLine("[BLE] ConnectAsync: success");
             return true;
         }
 
