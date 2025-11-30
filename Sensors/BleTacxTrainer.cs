@@ -112,12 +112,8 @@ namespace ErgTrainer.Sensors
                 }
 
                 Debug.WriteLine("[Tacx] Device does not have Fitness Machine Service or Cycling Power Service.");
-                // Disconnect only if it's not a trainer
-                try
-                {
-                    gatt.Disconnect();
-                }
-                catch { }
+                // Don't disconnect - leave connection open for HRM check to use
+                // The HRM check will handle the connection
                 return false;
             }
             catch (Exception ex)

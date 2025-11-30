@@ -81,33 +81,50 @@ namespace ErgTrainer.Sensors
                 // Get GATT instance - handle disposed object
                 var gatt = device.Gatt;
                 
-                // Try to connect without disconnecting first (disconnect might dispose it)
-                Debug.WriteLine("[BLE] Connecting GATT to check services…");
+                // Check if already connected (from previous Tacx check)
+                bool alreadyConnected = false;
                 try
                 {
+                    // Try to connect - might already be connected
                     await gatt.ConnectAsync();
                 }
                 catch (ObjectDisposedException)
                 {
-                    Debug.WriteLine("[BLE] GATT was disposed during ConnectAsync");
+                    Debug.WriteLine("[BLE] GATT was disposed, waiting and retrying...");
+                    // Wait a bit for cleanup from previous check
+                    await Task.Delay(500);
                     // Try to get a fresh GATT instance
                     try
                     {
                         gatt = device.Gatt;
                         await gatt.ConnectAsync();
                     }
-                    catch
+                    catch (ObjectDisposedException)
                     {
-                        Debug.WriteLine("[BLE] Failed to get fresh GATT instance");
+                        Debug.WriteLine("[BLE] GATT still disposed after retry - device may need re-scan");
+                        return false;
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[BLE] Failed to connect with fresh GATT: {ex.Message}");
                         return false;
                     }
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"[BLE] ConnectAsync failed: {ex.Message}");
-                    return false;
+                    // If connection fails with other error, might already be connected
+                    Debug.WriteLine($"[BLE] ConnectAsync returned error (might be connected): {ex.Message}");
+                    alreadyConnected = true;
                 }
-                Debug.WriteLine("[BLE] GATT connected.");
+                
+                if (!alreadyConnected)
+                {
+                    Debug.WriteLine("[BLE] GATT connected.");
+                }
+                else
+                {
+                    Debug.WriteLine("[BLE] GATT already connected (from previous check).");
+                }
 
                 Debug.WriteLine("[BLE] Checking for HeartRate service…");
                 var hrService = await gatt.GetPrimaryServiceAsync(HeartRateServiceUuid);
