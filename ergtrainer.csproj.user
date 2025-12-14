@@ -2,6 +2,12 @@
 <Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup />
   <ItemGroup>
+    <Compile Update="Controls\TimeSeriesChart.cs">
+      <SubType>Component</SubType>
+    </Compile>
+    <Compile Update="Controls\TrainingTimerControl.cs">
+      <SubType>UserControl</SubType>
+    </Compile>
     <Compile Update="MainForm.cs">
       <SubType>Form</SubType>
     </Compile>

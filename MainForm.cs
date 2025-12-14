@@ -357,7 +357,9 @@ namespace ErgTrainer
             }
             catch (Exception ex)
             {
-                _lblTacxStatus.Text = $"Status: connection error - {ex.Message}";
+                //_lblTacxStatus.Text = $"Status: connection error - {ex.Message}";
+                Debug.WriteLine(ex.ToString()); // <-- includes stack trace + line number
+                _lblTacxStatus.Text = $"Status: connection error - {ex.GetType().Name}: {ex.Message}";
             }
         }
 
