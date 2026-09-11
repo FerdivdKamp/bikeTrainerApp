@@ -1,0 +1,11 @@
+# .NET build output
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio and Rider local settings
+.vs/
+.idea/
+*.user
+*.suo
+*.rsuser
+*.DotSettings.user

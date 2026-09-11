@@ -38,6 +38,7 @@ namespace ErgTrainer
         private readonly TimeSeriesChart _chartPower;
         private readonly TimeSeriesChart _chartCadence;
         private readonly TimeSeriesChart _chartSpeed;
+        private readonly TimeSeriesChart _chartHeartRate;
 
         // Timer Section
         private readonly GroupBox _grpTimer;
@@ -49,7 +50,7 @@ namespace ErgTrainer
         {
             Text = "ergtrainer – Tacx Trainer + HRM";
             Width = 1400;
-            Height = 900;
+            Height = 1060;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
 
@@ -183,7 +184,7 @@ namespace ErgTrainer
                 Left = 690,
                 Top = 20,
                 Width = 680,
-                Height = 840
+                Height = 1000
             };
 
             _chartPower = new TimeSeriesChart("Power", "W", Color.Red)
@@ -191,15 +192,15 @@ namespace ErgTrainer
                 Left = 10,
                 Top = 25,
                 Width = 660,
-                Height = 260
+                Height = 240
             };
 
             _chartCadence = new TimeSeriesChart("Cadence", "rpm", Color.Blue)
             {
                 Left = 10,
-                Top = 295,
+                Top = 275,
                 Width = 660,
-                Height = 260
+                Height = 240
             };
 
             _chartSpeed = new TimeSeriesChart("Speed", "kph", Color.Green)
@@ -207,14 +208,23 @@ namespace ErgTrainer
                 Left = 10,
                 Top = 565,
                 Width = 660,
-                Height = 260
+                Height = 200
+            };
+
+            _chartHeartRate = new TimeSeriesChart("Heart Rate", "bpm", Color.Orange)
+            {
+                Left = 10,
+                Top = 775,
+                Width = 660,
+                Height = 200
             };
 
             _grpCharts.Controls.AddRange(new Control[]
             {
                 _chartPower,
                 _chartCadence,
-                _chartSpeed
+                _chartSpeed,
+                _chartHeartRate
             });
 
             // Timer Section
@@ -411,6 +421,10 @@ namespace ErgTrainer
                     _lblHrmStatus.Text = $"Status: connected to {device.Name ?? "HRM"}";
                     _btnDisconnectHrm.Enabled = true;
                     _lblHeartRate.Text = "HR: -- bpm";
+                    
+                    // Start heart rate chart recording
+                    _chartHeartRate.StartRecording();
+                    
                     // Remove device from list when connected
                     int index = _availableDevices.IndexOf(device);
                     if (index >= 0)
@@ -437,6 +451,9 @@ namespace ErgTrainer
             _lblHrmStatus.Text = "Status: HRM disconnected";
             _btnDisconnectHrm.Enabled = false;
             _lblHeartRate.Text = "HR: -- bpm";
+            
+            // Stop heart rate chart recording
+            _chartHeartRate.StopRecording();
         }
 
         private void HrmSensor_HeartRateReceived(object? sender, int bpm)
@@ -448,6 +465,13 @@ namespace ErgTrainer
             }
 
             _lblHeartRate.Text = $"HR: {bpm} bpm";
+            
+            // Update heart rate chart (only if timer is running and not paused)
+            if (_trainingTimer.IsRunning)
+            {
+                var timestamp = DateTime.Now;
+                _chartHeartRate.AddDataPoint(bpm, timestamp);
+            }
         }
 
         #endregion

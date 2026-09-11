@@ -1,6 +1,7 @@
 using InTheHand.Bluetooth;
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -35,6 +36,7 @@ namespace ErgTrainer.Sensors
         private GattService? _ftmsService;
         private GattCharacteristic? _indoorBikeDataCharacteristic;
         private CancellationTokenSource? _pollingCts;
+        private StreamWriter? _logWriter;
 
         /// <summary>
         /// Checks if a device is a Tacx trainer by checking for the Fitness Machine Service.
@@ -224,6 +226,38 @@ namespace ErgTrainer.Sensors
             _pollingCts = new CancellationTokenSource();
             _ = Task.Run(() => PollLoopAsync(_pollingCts.Token), _pollingCts.Token);
 
+            // Open log file for raw data
+            try
+            {
+                // Use absolute path in the application directory
+                string appDirectory = AppDomain.CurrentDomain.BaseDirectory;
+                string logFileName = Path.Combine(appDirectory, $"TacxRawData_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+                string fullPath = Path.GetFullPath(logFileName);
+                
+                _logWriter = new StreamWriter(fullPath, append: false);
+                _logWriter.WriteLine($"Tacx Raw Data Log - Started: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                _logWriter.WriteLine($"Device: {device.Name ?? "Unknown"} ({device.Id})");
+                _logWriter.WriteLine($"Format: Timestamp (HH:mm:ss.fff): Raw Data (hex)");
+                _logWriter.WriteLine(new string('-', 80));
+                _logWriter.Flush();
+                
+                // Verify file was created
+                if (File.Exists(fullPath))
+                {
+                    Debug.WriteLine($"[Tacx] Log file created successfully: {fullPath}");
+                }
+                else
+                {
+                    Debug.WriteLine($"[Tacx] WARNING: Log file does not exist after creation: {fullPath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Tacx] Failed to open log file: {ex.Message}");
+                Debug.WriteLine($"[Tacx] Exception details: {ex}");
+                _logWriter = null;
+            }
+
             Debug.WriteLine("[Tacx] ConnectToDeviceAsync: success");
             return true;
         }
@@ -252,6 +286,24 @@ namespace ErgTrainer.Sensors
             // we're done with the service too
             _ftmsService = null;
 
+            // Close log file
+            if (_logWriter != null)
+            {
+                try
+                {
+                    _logWriter.WriteLine(new string('-', 80));
+                    _logWriter.WriteLine($"Log ended: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                    _logWriter.Close();
+                    _logWriter.Dispose();
+                    _logWriter = null;
+                    Debug.WriteLine("[Tacx] Log file closed");
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[Tacx] Error closing log file: {ex.Message}");
+                }
+            }
+
             // drop the device reference
             _device = null;
         }
@@ -265,6 +317,28 @@ namespace ErgTrainer.Sensors
                 if (data != null && data.Length > 0)
                 {
                     Debug.WriteLine($"[Tacx] Data: {BitConverter.ToString(data)}");
+                    
+                    // Log raw data to file
+                    if (_logWriter != null && data != null)
+                    {
+                        try
+                        {
+                            string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
+                            string hexData = BitConverter.ToString(data);
+                            _logWriter.WriteLine($"{timestamp}: {hexData}");
+                            _logWriter.Flush(); // Flush immediately to ensure data is written
+                            Debug.WriteLine($"[Tacx] Logged to file: {timestamp}: {hexData}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"[Tacx] Error writing to log file: {ex.Message}");
+                            Debug.WriteLine($"[Tacx] Exception details: {ex}");
+                        }
+                    }
+                    else
+                    {
+                        Debug.WriteLine($"[Tacx] LogWriter is null: {_logWriter == null}, data is null: {data == null}");
+                    }
                 }
 
                 if (data != null && data.Length >= 2)
@@ -302,6 +376,22 @@ namespace ErgTrainer.Sensors
                     if (data != null && data.Length > 0)
                     {
                         Debug.WriteLine($"[Tacx] Poll data: {BitConverter.ToString(data)}");
+                        
+                        // Log raw data to file (from polling)
+                        if (_logWriter != null && data != null)
+                        {
+                            try
+                            {
+                                string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
+                                string hexData = BitConverter.ToString(data);
+                                _logWriter.WriteLine($"{timestamp}: {hexData}");
+                                _logWriter.Flush();
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"[Tacx] Error writing to log file (poll): {ex.Message}");
+                            }
+                        }
                     }
 
                     if (data != null && data.Length >= 2)
@@ -431,8 +521,48 @@ namespace ErgTrainer.Sensors
             if (moreData && data.Length >= offset + 2)
             {
                 ushort speed = BitConverter.ToUInt16(data, offset);
-                speedKph = speed * 0.01; // Speed in km/h with resolution 0.01
-                Debug.WriteLine($"[Tacx] Instantaneous Speed @{offset}: {speed} -> {speedKph:F2} kph");
+                // Try different interpretations
+                double testSpeed1 = speed * 0.01;  // Standard FTMS (resolution 0.01)
+                double testSpeed2 = speed * 0.001; // Alternative resolution
+                // Try byte-swapped (big-endian interpretation)
+                ushort speedSwapped = (ushort)((speed >> 8) | (speed << 8));
+                double testSpeed3 = speedSwapped * 0.01;
+                double testSpeed4 = speedSwapped * 0.001;
+                double testSpeed5 = speedSwapped; // Direct value (no multiplier)
+                
+                // Use the interpretation that gives a reasonable speed (0-50 kph)
+                // Prefer byte-swapped with standard multiplier if it's reasonable
+                if (testSpeed3 >= 0 && testSpeed3 <= 50)
+                {
+                    speedKph = testSpeed3;
+                    Debug.WriteLine($"[Tacx] Instantaneous Speed @{offset}: {speed} (0x{speed:X4}) swapped={speedSwapped} *0.01 -> {speedKph:F2} kph");
+                }
+                else if (testSpeed5 >= 0 && testSpeed5 <= 50)
+                {
+                    speedKph = testSpeed5;
+                    Debug.WriteLine($"[Tacx] Instantaneous Speed @{offset}: {speed} (0x{speed:X4}) swapped={speedSwapped} direct -> {speedKph:F2} kph");
+                }
+                else if (testSpeed1 >= 0 && testSpeed1 <= 50)
+                {
+                    speedKph = testSpeed1;
+                    Debug.WriteLine($"[Tacx] Instantaneous Speed @{offset}: {speed} (0x{speed:X4}) *0.01 -> {speedKph:F2} kph");
+                }
+                else if (testSpeed2 >= 0 && testSpeed2 <= 50)
+                {
+                    speedKph = testSpeed2;
+                    Debug.WriteLine($"[Tacx] Instantaneous Speed @{offset}: {speed} (0x{speed:X4}) *0.001 -> {speedKph:F2} kph");
+                }
+                else if (testSpeed4 >= 0 && testSpeed4 <= 50)
+                {
+                    speedKph = testSpeed4;
+                    Debug.WriteLine($"[Tacx] Instantaneous Speed @{offset}: {speed} (0x{speed:X4}) swapped={speedSwapped} *0.001 -> {speedKph:F2} kph");
+                }
+                else
+                {
+                    // If none are reasonable, use byte-swapped with standard multiplier as fallback
+                    speedKph = testSpeed3;
+                    Debug.WriteLine($"[Tacx] Instantaneous Speed @{offset}: {speed} (0x{speed:X4}) -> {speedKph:F2} kph (tried: *0.01={testSpeed1:F2}, *0.001={testSpeed2:F2}, swapped*0.01={testSpeed3:F2}, swapped*0.001={testSpeed4:F2}, swapped direct={testSpeed5:F2})");
+                }
                 offset += 2;
             }
 
@@ -506,30 +636,60 @@ namespace ErgTrainer.Sensors
                 Debug.WriteLine($"[Tacx] Flags don't indicate cadence/power, but {remainingBytes} bytes remain (offset={offset}). Trying to find them...");
                 
                 // Try cadence at various positions after the parsed fields
-                // Common positions: offset 5-6, 7-8, 9-10
+                // Based on data: 03-00-24-00-70-01-00-00-9B-7D-55-00-3C-03
+                // After speed (1-2) and avg speed (3-4), offset = 5
+                // Try different interpretations at each position
                 if (cadenceRpm == 0)
                 {
                     for (int cadOffset = offset; cadOffset <= offset + 6 && cadOffset + 2 <= data.Length; cadOffset += 2)
                     {
                         ushort cadence = BitConverter.ToUInt16(data, cadOffset);
-                        double testCadence = cadence * 0.5;
+                        
+                        // Try different interpretations
+                        double testCadence1 = cadence * 0.5;  // FTMS standard
+                        double testCadence2 = cadence;        // Direct value
+                        double testCadence3 = cadence / 2.0;  // Alternative
+                        
+                        // Also try just the low byte
+                        byte cadenceLow = data[cadOffset];
+                        double testCadence4 = cadenceLow * 0.5;
+                        double testCadence5 = cadenceLow;
                         
                         // Accept reasonable cadence values (5-200 rpm)
-                        if (testCadence >= 5 && testCadence < 200)
+                        if (testCadence1 >= 5 && testCadence1 < 200)
                         {
-                            cadenceRpm = testCadence;
-                            Debug.WriteLine($"[Tacx] Cadence found @{cadOffset}: {cadence} -> {cadenceRpm:F1} rpm");
+                            cadenceRpm = testCadence1;
+                            Debug.WriteLine($"[Tacx] Cadence found @{cadOffset}: {cadence} (0x{cadence:X4}) *0.5 -> {cadenceRpm:F1} rpm");
+                            break;
+                        }
+                        else if (testCadence2 >= 5 && testCadence2 < 200)
+                        {
+                            cadenceRpm = testCadence2;
+                            Debug.WriteLine($"[Tacx] Cadence found @{cadOffset}: {cadence} (0x{cadence:X4}) direct -> {cadenceRpm:F1} rpm");
+                            break;
+                        }
+                        else if (testCadence4 >= 5 && testCadence4 < 200)
+                        {
+                            cadenceRpm = testCadence4;
+                            Debug.WriteLine($"[Tacx] Cadence found @{cadOffset}: low byte {cadenceLow} (0x{cadenceLow:X2}) *0.5 -> {cadenceRpm:F1} rpm");
+                            break;
+                        }
+                        else if (testCadence5 >= 5 && testCadence5 < 200)
+                        {
+                            cadenceRpm = testCadence5;
+                            Debug.WriteLine($"[Tacx] Cadence found @{cadOffset}: low byte {cadenceLow} (0x{cadenceLow:X2}) direct -> {cadenceRpm:F1} rpm");
                             break;
                         }
                         else
                         {
-                            Debug.WriteLine($"[Tacx] Cadence @{cadOffset}: {cadence} (*0.5 = {testCadence:F1} rpm, rejected)");
+                            Debug.WriteLine($"[Tacx] Cadence @{cadOffset}: {cadence} (0x{cadence:X4}) - *0.5={testCadence1:F1}, direct={testCadence2:F1}, low={cadenceLow} (rejected)");
                         }
                     }
                 }
                 
                 // Try power at various positions
-                // Common positions: offset 9-10, 11-12
+                // Based on data: 03-00-24-00-70-01-00-00-9B-7D-55-00-3C-03
+                // Try offset 9-10 (9B-7D), 11-12 (55-00), 13-14 (3C-03)
                 if (powerWatts == 0)
                 {
                     for (int powOffset = offset + 4; powOffset <= offset + 8 && powOffset + 2 <= data.Length; powOffset += 2)
@@ -537,23 +697,41 @@ namespace ErgTrainer.Sensors
                         ushort powerRaw = BitConverter.ToUInt16(data, powOffset);
                         short powerSigned = BitConverter.ToInt16(data, powOffset);
                         
+                        // Also try just the low byte
+                        byte powerLow = data[powOffset];
+                        byte powerHigh = data[powOffset + 1];
+                        
                         // Try signed first (FTMS uses signed for power)
                         if (powerSigned >= 5 && powerSigned < 2000)
                         {
                             powerWatts = powerSigned;
-                            Debug.WriteLine($"[Tacx] Power found @{powOffset} (signed): {powerSigned} -> {powerWatts:F0} W");
+                            Debug.WriteLine($"[Tacx] Power found @{powOffset}: {powerSigned} (0x{powerRaw:X4} signed) -> {powerWatts:F0} W");
                             break;
                         }
                         // Try unsigned
                         else if (powerRaw >= 5 && powerRaw < 2000)
                         {
                             powerWatts = powerRaw;
-                            Debug.WriteLine($"[Tacx] Power found @{powOffset} (unsigned): {powerRaw} -> {powerWatts:F0} W");
+                            Debug.WriteLine($"[Tacx] Power found @{powOffset}: {powerRaw} (0x{powerRaw:X4} unsigned) -> {powerWatts:F0} W");
+                            break;
+                        }
+                        // Try low byte only
+                        else if (powerLow >= 5 && powerLow < 2000)
+                        {
+                            powerWatts = powerLow;
+                            Debug.WriteLine($"[Tacx] Power found @{powOffset}: low byte {powerLow} (0x{powerLow:X2}) -> {powerWatts:F0} W");
+                            break;
+                        }
+                        // Try high byte only
+                        else if (powerHigh >= 5 && powerHigh < 2000)
+                        {
+                            powerWatts = powerHigh;
+                            Debug.WriteLine($"[Tacx] Power found @{powOffset}: high byte {powerHigh} (0x{powerHigh:X2}) -> {powerWatts:F0} W");
                             break;
                         }
                         else
                         {
-                            Debug.WriteLine($"[Tacx] Power @{powOffset}: {powerRaw}/{powerSigned} (rejected)");
+                            Debug.WriteLine($"[Tacx] Power @{powOffset}: {powerRaw} (0x{powerRaw:X4})/{powerSigned}, low={powerLow}, high={powerHigh} (rejected)");
                         }
                     }
                 }
