@@ -1,7 +1,6 @@
 using InTheHand.Bluetooth;
 using System;
 using System.Diagnostics;
-using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -31,12 +30,12 @@ namespace ErgTrainer.Sensors
         public string Name => "BLE Tacx Trainer";
 
         public event EventHandler<TrainerData>? DataUpdated;
+        public event EventHandler<RawDeviceData>? RawDataReceived;
 
         private BluetoothDevice? _device;
         private GattService? _ftmsService;
         private GattCharacteristic? _indoorBikeDataCharacteristic;
         private CancellationTokenSource? _pollingCts;
-        private StreamWriter? _logWriter;
 
         /// <summary>
         /// Checks if a device is a Tacx trainer by checking for the Fitness Machine Service.
@@ -226,38 +225,6 @@ namespace ErgTrainer.Sensors
             _pollingCts = new CancellationTokenSource();
             _ = Task.Run(() => PollLoopAsync(_pollingCts.Token), _pollingCts.Token);
 
-            // Open log file for raw data
-            try
-            {
-                // Use absolute path in the application directory
-                string appDirectory = AppDomain.CurrentDomain.BaseDirectory;
-                string logFileName = Path.Combine(appDirectory, $"TacxRawData_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
-                string fullPath = Path.GetFullPath(logFileName);
-                
-                _logWriter = new StreamWriter(fullPath, append: false);
-                _logWriter.WriteLine($"Tacx Raw Data Log - Started: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-                _logWriter.WriteLine($"Device: {device.Name ?? "Unknown"} ({device.Id})");
-                _logWriter.WriteLine($"Format: Timestamp (HH:mm:ss.fff): Raw Data (hex)");
-                _logWriter.WriteLine(new string('-', 80));
-                _logWriter.Flush();
-                
-                // Verify file was created
-                if (File.Exists(fullPath))
-                {
-                    Debug.WriteLine($"[Tacx] Log file created successfully: {fullPath}");
-                }
-                else
-                {
-                    Debug.WriteLine($"[Tacx] WARNING: Log file does not exist after creation: {fullPath}");
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"[Tacx] Failed to open log file: {ex.Message}");
-                Debug.WriteLine($"[Tacx] Exception details: {ex}");
-                _logWriter = null;
-            }
-
             Debug.WriteLine("[Tacx] ConnectToDeviceAsync: success");
             return true;
         }
@@ -286,24 +253,6 @@ namespace ErgTrainer.Sensors
             // we're done with the service too
             _ftmsService = null;
 
-            // Close log file
-            if (_logWriter != null)
-            {
-                try
-                {
-                    _logWriter.WriteLine(new string('-', 80));
-                    _logWriter.WriteLine($"Log ended: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-                    _logWriter.Close();
-                    _logWriter.Dispose();
-                    _logWriter = null;
-                    Debug.WriteLine("[Tacx] Log file closed");
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"[Tacx] Error closing log file: {ex.Message}");
-                }
-            }
-
             // drop the device reference
             _device = null;
         }
@@ -317,28 +266,8 @@ namespace ErgTrainer.Sensors
                 if (data != null && data.Length > 0)
                 {
                     Debug.WriteLine($"[Tacx] Data: {BitConverter.ToString(data)}");
+                    PublishRawData(data, "notification");
                     
-                    // Log raw data to file
-                    if (_logWriter != null && data != null)
-                    {
-                        try
-                        {
-                            string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
-                            string hexData = BitConverter.ToString(data);
-                            _logWriter.WriteLine($"{timestamp}: {hexData}");
-                            _logWriter.Flush(); // Flush immediately to ensure data is written
-                            Debug.WriteLine($"[Tacx] Logged to file: {timestamp}: {hexData}");
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.WriteLine($"[Tacx] Error writing to log file: {ex.Message}");
-                            Debug.WriteLine($"[Tacx] Exception details: {ex}");
-                        }
-                    }
-                    else
-                    {
-                        Debug.WriteLine($"[Tacx] LogWriter is null: {_logWriter == null}, data is null: {data == null}");
-                    }
                 }
 
                 if (data != null && data.Length >= 2)
@@ -376,22 +305,8 @@ namespace ErgTrainer.Sensors
                     if (data != null && data.Length > 0)
                     {
                         Debug.WriteLine($"[Tacx] Poll data: {BitConverter.ToString(data)}");
+                        PublishRawData(data, "poll");
                         
-                        // Log raw data to file (from polling)
-                        if (_logWriter != null && data != null)
-                        {
-                            try
-                            {
-                                string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
-                                string hexData = BitConverter.ToString(data);
-                                _logWriter.WriteLine($"{timestamp}: {hexData}");
-                                _logWriter.Flush();
-                            }
-                            catch (Exception ex)
-                            {
-                                Debug.WriteLine($"[Tacx] Error writing to log file (poll): {ex.Message}");
-                            }
-                        }
                     }
 
                     if (data != null && data.Length >= 2)
@@ -428,6 +343,18 @@ namespace ErgTrainer.Sensors
                     break;
                 }
             }
+        }
+
+        private void PublishRawData(byte[] data, string deliveryMethod)
+        {
+            RawDataReceived?.Invoke(this, new RawDeviceData(
+                DateTimeOffset.UtcNow,
+                "trainer",
+                _device?.Name ?? "Tacx Trainer",
+                deliveryMethod,
+                _ftmsService?.Uuid ?? Guid.Empty,
+                _indoorBikeDataCharacteristic?.Uuid ?? Guid.Empty,
+                (byte[])data.Clone()));
         }
 
         private TrainerData? ParseIndoorBikeData(byte[] data)

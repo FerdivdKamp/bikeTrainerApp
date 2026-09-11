@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
+using ErgTrainer.Sensors;
 
 public class DataRecorder
 {
@@ -93,7 +94,7 @@ public class DataRecorder
 
 public class TacxDevice
 {
-    private TacxDataRecorder _dataRecorder = new();
+    private DataRecorder _dataRecorder = new();
     private TacxDevice _device = new();
     private bool _isConnected = false;
 

@@ -26,6 +26,7 @@ namespace ErgTrainer.Sensors
         public string Name => "BLE HRM";
 
         public event EventHandler<int>? HeartRateReceived;
+        public event EventHandler<RawDeviceData>? RawDataReceived;
 
         private BluetoothDevice? _device;
         private GattService? _hrService;
@@ -218,6 +219,7 @@ namespace ErgTrainer.Sensors
             try
             {
                 await _hrCharacteristic.StartNotificationsAsync();
+                _hrCharacteristic.CharacteristicValueChanged += HrCharacteristic_ValueChanged;
                 Debug.WriteLine("[BLE] Notifications started.");
             }
             catch (Exception ex)
@@ -243,6 +245,7 @@ namespace ErgTrainer.Sensors
             {
                 try
                 {
+                    _hrCharacteristic.CharacteristicValueChanged -= HrCharacteristic_ValueChanged;
                     await _hrCharacteristic.StopNotificationsAsync();
                 }
                 catch
@@ -271,31 +274,7 @@ namespace ErgTrainer.Sensors
                 {
                     byte[] data = await _hrCharacteristic.ReadValueAsync();
 
-                    if (data.Length >= 2)
-                    {
-                        byte flags = data[0];
-                        int hr;
-
-                        // Bit 0 of flags = 0: HR is 8-bit in byte 1
-                        // Bit 0 of flags = 1: HR is 16-bit in bytes 1–2 (little-endian)
-                        if ((flags & 0x01) == 0)
-                        {
-                            hr = data[1];
-                        }
-                        else if (data.Length >= 3)
-                        {
-                            hr = data[1] | (data[2] << 8);
-                        }
-                        else
-                        {
-                            hr = 0;
-                        }
-
-                        if (hr > 0)
-                        {
-                            HeartRateReceived?.Invoke(this, hr);
-                        }
-                    }
+                    ProcessHeartRateData(data, "poll");
                 }
                 catch (OperationCanceledException)
                 {
@@ -314,6 +293,40 @@ namespace ErgTrainer.Sensors
                 {
                     break;
                 }
+            }
+        }
+
+        private void HrCharacteristic_ValueChanged(object? sender, GattCharacteristicValueChangedEventArgs e)
+        {
+            ProcessHeartRateData(e.Value, "notification");
+        }
+
+        private void ProcessHeartRateData(byte[] data, string deliveryMethod)
+        {
+            RawDataReceived?.Invoke(this, new RawDeviceData(
+                DateTimeOffset.UtcNow,
+                "heart-rate-monitor",
+                _device?.Name ?? "Heart Rate Monitor",
+                deliveryMethod,
+                _hrService?.Uuid ?? Guid.Empty,
+                _hrCharacteristic?.Uuid ?? Guid.Empty,
+                (byte[])data.Clone()));
+
+            if (data.Length < 2)
+            {
+                return;
+            }
+
+            byte flags = data[0];
+            int heartRate = (flags & 0x01) == 0
+                ? data[1]
+                : data.Length >= 3
+                    ? data[1] | (data[2] << 8)
+                    : 0;
+
+            if (heartRate > 0)
+            {
+                HeartRateReceived?.Invoke(this, heartRate);
             }
         }
     }

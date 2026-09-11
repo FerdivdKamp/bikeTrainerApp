@@ -6,6 +6,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using ErgTrainer.Controls;
+using ErgTrainer.Recorders;
 using ErgTrainer.Sensors;
 using InTheHand.Bluetooth;
 
@@ -15,11 +16,15 @@ namespace ErgTrainer
     {
         private readonly BleTacxTrainer _tacxTrainer;
         private readonly BleHeartRateSensor _hrmSensor;
+        private readonly SignalRecorder _signalRecorder;
 
         // Shared Device List
         private readonly GroupBox _grpDevices;
         private readonly Button _btnScan;
         private readonly ListBox _listDevices;
+        private readonly CheckBox _chkRecordSignals;
+        private readonly Label _lblRecordingStatus;
+        private bool _changingRecordingState;
 
         // Tacx Trainer Section
         private readonly GroupBox _grpTacx;
@@ -57,9 +62,12 @@ namespace ErgTrainer
             // Initialize sensors
             _tacxTrainer = new BleTacxTrainer();
             _tacxTrainer.DataUpdated += TacxTrainer_DataUpdated;
+            _tacxTrainer.RawDataReceived += Device_RawDataReceived;
 
             _hrmSensor = new BleHeartRateSensor();
             _hrmSensor.HeartRateReceived += HrmSensor_HeartRateReceived;
+            _hrmSensor.RawDataReceived += Device_RawDataReceived;
+            _signalRecorder = new SignalRecorder();
 
             // Shared Device List Section
             _grpDevices = new GroupBox
@@ -68,7 +76,7 @@ namespace ErgTrainer
                 Left = 20,
                 Top = 20,
                 Width = 300,
-                Height = 420
+                Height = 490
             };
 
             _btnScan = new Button
@@ -87,10 +95,29 @@ namespace ErgTrainer
                 Height = 350
             };
 
+            _chkRecordSignals = new CheckBox
+            {
+                Text = "Record raw device signals",
+                Left = 10,
+                Top = 415,
+                AutoSize = true
+            };
+
+            _lblRecordingStatus = new Label
+            {
+                Text = "Recording: off",
+                Left = 10,
+                Top = 445,
+                Width = 280,
+                AutoEllipsis = true
+            };
+
             _grpDevices.Controls.AddRange(new Control[]
             {
                 _btnScan,
-                _listDevices
+                _listDevices,
+                _chkRecordSignals,
+                _lblRecordingStatus
             });
 
             // Tacx Trainer Section
@@ -262,6 +289,7 @@ namespace ErgTrainer
             _listDevices.DoubleClick += ListDevices_DoubleClick;
             _btnDisconnectTacx.Click += BtnDisconnectTacx_Click;
             _btnDisconnectHrm.Click += BtnDisconnectHrm_Click;
+            _chkRecordSignals.CheckedChanged += ChkRecordSignals_CheckedChanged;
         }
 
         #region Device Scanning Methods
@@ -334,6 +362,48 @@ namespace ErgTrainer
         }
 
         #endregion
+
+        private void ChkRecordSignals_CheckedChanged(object? sender, EventArgs e)
+        {
+            if (_changingRecordingState)
+            {
+                return;
+            }
+
+            try
+            {
+                if (_chkRecordSignals.Checked)
+                {
+                    var filePath = _signalRecorder.StartRecording();
+                    _lblRecordingStatus.Text = $"Recording: {filePath}";
+                }
+                else
+                {
+                    _signalRecorder.StopRecording();
+                    _lblRecordingStatus.Text = "Recording: off";
+                }
+            }
+            catch (Exception ex)
+            {
+                _changingRecordingState = true;
+                _chkRecordSignals.Checked = false;
+                _changingRecordingState = false;
+                _lblRecordingStatus.Text = "Recording: failed";
+                MessageBox.Show($"Unable to start recording: {ex.Message}", "Recording Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void Device_RawDataReceived(object? sender, RawDeviceData data)
+        {
+            try
+            {
+                _signalRecorder.Record(data);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[MainForm] Unable to record raw device data: {ex.Message}");
+            }
+        }
 
         #region Tacx Trainer Methods
 
@@ -506,6 +576,9 @@ namespace ErgTrainer
 
         protected override async void OnFormClosed(FormClosedEventArgs e)
         {
+            _signalRecorder.Dispose();
+            _tacxTrainer.RawDataReceived -= Device_RawDataReceived;
+            _hrmSensor.RawDataReceived -= Device_RawDataReceived;
             base.OnFormClosed(e);
             
             await _tacxTrainer.DisconnectAsync();
