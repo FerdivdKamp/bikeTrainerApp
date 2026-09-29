@@ -9,3 +9,5 @@
 *.suo
 *.rsuser
 *.DotSettings.user
+
+%SystemDrive%/
