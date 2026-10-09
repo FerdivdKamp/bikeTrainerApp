@@ -23,6 +23,8 @@ namespace ErgTrainer.Sensors
         // Indoor Bike Data characteristic UUID (FTMS)
         private static readonly Guid IndoorBikeDataUuid =
             Guid.Parse("00002ad2-0000-1000-8000-00805f9b34fb");
+        private static readonly Guid FitnessMachineControlPointUuid =
+            Guid.Parse("00002ad9-0000-1000-8000-00805f9b34fb");
         
         // Cycling Power Measurement characteristic UUID
         private static readonly Guid CyclingPowerMeasurementUuid =
@@ -326,7 +328,16 @@ namespace ErgTrainer.Sensors
             // we're done with the service too
             _ftmsService = null;
 
-            // drop the device reference
+            // End the GATT session so any FTMS control permission is released.
+            try
+            {
+                _device?.Gatt.Disconnect();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Tacx] Unable to disconnect GATT: {ex.Message}");
+            }
+
             _device = null;
         }
 
@@ -422,6 +433,69 @@ namespace ErgTrainer.Sensors
             }
 
             return sampled;
+        }
+
+        public async Task<string> TestFtmsControlAsync(CancellationToken cancellationToken = default)
+        {
+            if (_device == null || _ftmsService?.Uuid != FitnessMachineServiceUuid)
+            {
+                return "FTMS control is unavailable on this connection.";
+            }
+
+            var controlPoint = await _ftmsService.GetCharacteristicAsync(FitnessMachineControlPointUuid);
+            if (controlPoint == null ||
+                (controlPoint.Properties & GattCharacteristicProperties.Write) == 0 ||
+                (controlPoint.Properties & GattCharacteristicProperties.Indicate) == 0)
+            {
+                return "FTMS control point with write and indication support was not found.";
+            }
+
+            var response = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+            void OnResponse(object? sender, GattCharacteristicValueChangedEventArgs e)
+            {
+                if (e.Error != null)
+                {
+                    response.TrySetException(new InvalidOperationException($"Control point indication failed: {e.Error}"));
+                    return;
+                }
+
+                byte[]? value = e.Value;
+                if (value != null && value.Length >= 3 && value[0] == 0x80 && value[1] == 0x00)
+                {
+                    response.TrySetResult((byte[])value.Clone());
+                }
+            }
+
+            controlPoint.CharacteristicValueChanged += OnResponse;
+            try
+            {
+                await controlPoint.StartNotificationsAsync();
+                cancellationToken.ThrowIfCancellationRequested();
+                await controlPoint.WriteValueWithResponseAsync(new byte[] { 0x00 });
+                byte[] reply = await response.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken);
+                string result = reply[2] switch
+                {
+                    0x01 => "Success: trainer granted control.",
+                    0x02 => "Trainer rejected the request: command unsupported.",
+                    0x03 => "Trainer rejected the request: invalid parameter.",
+                    0x04 => "Trainer rejected the request: operation failed.",
+                    0x05 => "Trainer rejected the request: control not permitted.",
+                    _ => $"Trainer returned result code 0x{reply[2]:X2}."
+                };
+                return $"{result} Raw response: {Convert.ToHexString(reply)}";
+            }
+            finally
+            {
+                controlPoint.CharacteristicValueChanged -= OnResponse;
+                try
+                {
+                    await controlPoint.StopNotificationsAsync();
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[Tacx] Unable to stop control point indications: {ex.Message}");
+                }
+            }
         }
 
         private void CscMeasurementCharacteristic_ValueChanged(object? sender, GattCharacteristicValueChangedEventArgs e)

@@ -29,8 +29,10 @@ namespace ErgTrainer
         // Tacx Trainer Section
         private readonly GroupBox _grpTacx;
         private readonly Button _btnDisconnectTacx;
+        private readonly Button _btnTestFtmsControl;
         private readonly Label _lblTacxStatus;
         private readonly Label _lblTacxData;
+        private readonly Label _lblFtmsControlResponse;
 
         // HRM Section
         private readonly GroupBox _grpHrm;
@@ -155,11 +157,31 @@ namespace ErgTrainer
                 AutoSize = true
             };
 
+            _btnTestFtmsControl = new Button
+            {
+                Text = "Test FTMS control",
+                Left = 10,
+                Top = 130,
+                Width = 150,
+                Enabled = false
+            };
+
+            _lblFtmsControlResponse = new Label
+            {
+                Text = "Control test: not run",
+                Left = 10,
+                Top = 165,
+                Width = 300,
+                Height = 30
+            };
+
             _grpTacx.Controls.AddRange(new Control[]
             {
                 _btnDisconnectTacx,
                 _lblTacxStatus,
-                _lblTacxData
+                _lblTacxData,
+                _btnTestFtmsControl,
+                _lblFtmsControlResponse
             });
 
             // HRM Section
@@ -288,6 +310,7 @@ namespace ErgTrainer
             _btnScan.Click += BtnScan_Click;
             _listDevices.DoubleClick += ListDevices_DoubleClick;
             _btnDisconnectTacx.Click += BtnDisconnectTacx_Click;
+            _btnTestFtmsControl.Click += BtnTestFtmsControl_Click;
             _btnDisconnectHrm.Click += BtnDisconnectHrm_Click;
             _chkRecordSignals.CheckedChanged += ChkRecordSignals_CheckedChanged;
         }
@@ -441,6 +464,8 @@ namespace ErgTrainer
                         : "GATT: discovery unavailable";
                     _lblTacxStatus.Text = $"Status: {device.Name ?? "trainer"} | CSC: {cscStatus}\n{gattStatus}";
                     _btnDisconnectTacx.Enabled = true;
+                    _btnTestFtmsControl.Enabled = true;
+                    _lblFtmsControlResponse.Text = "Control test: not run";
                     _lblTacxData.Text = "Power: -- W | Cadence: -- rpm | Speed: -- kph";
                     await SampleTrainerCharacteristicsAsync();
                     
@@ -471,12 +496,53 @@ namespace ErgTrainer
             await _tacxTrainer.DisconnectAsync();
             _lblTacxStatus.Text = "Status: trainer disconnected";
             _btnDisconnectTacx.Enabled = false;
+            _btnTestFtmsControl.Enabled = false;
+            _lblFtmsControlResponse.Text = "Control test: not run";
             _lblTacxData.Text = "Power: -- W | Cadence: -- rpm | Speed: -- kph";
             
             // Stop chart recording
             _chartPower.StopRecording();
             _chartCadence.StopRecording();
             _chartSpeed.StopRecording();
+        }
+
+        private async void BtnTestFtmsControl_Click(object? sender, EventArgs e)
+        {
+            _btnTestFtmsControl.Enabled = false;
+            _lblFtmsControlResponse.Text = "Control test: waiting for reply...";
+
+            try
+            {
+                string result = await _tacxTrainer.TestFtmsControlAsync();
+                if (!IsDisposed)
+                {
+                    _lblFtmsControlResponse.Text = result;
+                    MessageBox.Show(result, "FTMS Control Test", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+            catch (TimeoutException)
+            {
+                if (!IsDisposed)
+                {
+                    _lblFtmsControlResponse.Text = "Control test: no response within 5 seconds";
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[MainForm] FTMS control test failed: {ex}");
+                if (!IsDisposed)
+                {
+                    _lblFtmsControlResponse.Text = $"Control test failed: {ex.Message}";
+                    MessageBox.Show(ex.Message, "FTMS Control Test", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+            finally
+            {
+                if (!IsDisposed)
+                {
+                    _btnTestFtmsControl.Enabled = _btnDisconnectTacx.Enabled;
+                }
+            }
         }
 
         private void TacxTrainer_DataUpdated(object? sender, TrainerData data)
