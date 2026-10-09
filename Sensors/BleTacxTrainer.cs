@@ -1,5 +1,6 @@
 using InTheHand.Bluetooth;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
@@ -27,15 +28,27 @@ namespace ErgTrainer.Sensors
         private static readonly Guid CyclingPowerMeasurementUuid =
             Guid.Parse("00002a63-0000-1000-8000-00805f9b34fb");
 
+        // Cycling Speed and Cadence Service and CSC Measurement characteristic
+        private static readonly Guid CyclingSpeedCadenceServiceUuid =
+            Guid.Parse("00001816-0000-1000-8000-00805f9b34fb");
+        private static readonly Guid CscMeasurementUuid =
+            Guid.Parse("00002a5b-0000-1000-8000-00805f9b34fb");
+
         public string Name => "BLE Tacx Trainer";
 
         public event EventHandler<TrainerData>? DataUpdated;
         public event EventHandler<RawDeviceData>? RawDataReceived;
+        public bool HasCyclingSpeedCadenceNotifications => _cscMeasurementCharacteristic != null;
+        public int? CharacteristicCount { get; private set; }
+        public int OtherCharacteristicCount => _otherCharacteristics.Count;
 
         private BluetoothDevice? _device;
         private GattService? _ftmsService;
         private GattCharacteristic? _indoorBikeDataCharacteristic;
+        private GattService? _cscService;
+        private GattCharacteristic? _cscMeasurementCharacteristic;
         private CancellationTokenSource? _pollingCts;
+        private readonly List<GattCharacteristic> _otherCharacteristics = new();
 
         /// <summary>
         /// Checks if a device is a Tacx trainer by checking for the Fitness Machine Service.
@@ -143,6 +156,8 @@ namespace ErgTrainer.Sensors
 
             Debug.WriteLine($"[Tacx] ConnectToDeviceAsync: connecting to device Name='{device.Name}', Id='{device.Id}'");
 
+            _otherCharacteristics.Clear();
+            CharacteristicCount = null;
             _device = device;
 
             var gatt = _device.Gatt;
@@ -221,6 +236,46 @@ namespace ErgTrainer.Sensors
                 Debug.WriteLine($"[Tacx] StartNotificationsAsync failed (ignored): {ex.Message}");
             }
 
+            // Capture the standard speed/cadence characteristic separately when available.
+            try
+            {
+                _cscService = await gatt.GetPrimaryServiceAsync(CyclingSpeedCadenceServiceUuid);
+                if (_cscService != null)
+                {
+                    var characteristic = await _cscService.GetCharacteristicAsync(CscMeasurementUuid);
+                    if (characteristic != null)
+                    {
+                        characteristic.CharacteristicValueChanged += CscMeasurementCharacteristic_ValueChanged;
+                        try
+                        {
+                            await characteristic.StartNotificationsAsync();
+                            _cscMeasurementCharacteristic = characteristic;
+                            Debug.WriteLine("[Tacx] CSC Measurement notifications started.");
+                        }
+                        catch
+                        {
+                            characteristic.CharacteristicValueChanged -= CscMeasurementCharacteristic_ValueChanged;
+                            throw;
+                        }
+                    }
+                    else
+                    {
+                        Debug.WriteLine("[Tacx] CSC Measurement characteristic not found.");
+                    }
+                }
+                else
+                {
+                    Debug.WriteLine("[Tacx] Cycling Speed and Cadence Service not found.");
+                }
+            }
+            catch (Exception ex)
+            {
+                _cscService = null;
+                Debug.WriteLine($"[Tacx] CSC notifications unavailable: {ex.Message}");
+            }
+
+            await DiscoverOtherCharacteristicsAsync(gatt, cancellationToken);
+
             Debug.WriteLine("[Tacx] Starting polling loop (as backup)...");
             _pollingCts = new CancellationTokenSource();
             _ = Task.Run(() => PollLoopAsync(_pollingCts.Token), _pollingCts.Token);
@@ -234,6 +289,24 @@ namespace ErgTrainer.Sensors
             // stop our polling loop
             _pollingCts?.Cancel();
             _pollingCts = null;
+            _otherCharacteristics.Clear();
+            CharacteristicCount = null;
+
+            if (_cscMeasurementCharacteristic != null)
+            {
+                try
+                {
+                    _cscMeasurementCharacteristic.CharacteristicValueChanged -= CscMeasurementCharacteristic_ValueChanged;
+                    await _cscMeasurementCharacteristic.StopNotificationsAsync();
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[Tacx] Unable to stop CSC notifications: {ex.Message}");
+                }
+
+                _cscMeasurementCharacteristic = null;
+            }
+            _cscService = null;
 
             if (_indoorBikeDataCharacteristic != null)
             {
@@ -255,6 +328,123 @@ namespace ErgTrainer.Sensors
 
             // drop the device reference
             _device = null;
+        }
+
+        private async Task DiscoverOtherCharacteristicsAsync(RemoteGattServer gatt, CancellationToken token)
+        {
+            _otherCharacteristics.Clear();
+            CharacteristicCount = null;
+            int count = 0;
+            bool complete = true;
+
+            try
+            {
+                var services = await gatt.GetPrimaryServicesAsync();
+                foreach (var service in services)
+                {
+                    token.ThrowIfCancellationRequested();
+                    try
+                    {
+                        var characteristics = await service.GetCharacteristicsAsync();
+                        foreach (var characteristic in characteristics)
+                        {
+                            count++;
+                            if ((service.Uuid == _ftmsService?.Uuid && characteristic.Uuid == _indoorBikeDataCharacteristic?.Uuid) ||
+                                (service.Uuid == CyclingSpeedCadenceServiceUuid && characteristic.Uuid == CscMeasurementUuid))
+                            {
+                                continue;
+                            }
+
+                            _otherCharacteristics.Add(characteristic);
+                            Debug.WriteLine($"[Tacx] GATT {service.Uuid}/{characteristic.Uuid}: {characteristic.Properties}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        complete = false;
+                        Debug.WriteLine($"[Tacx] Unable to inspect service {service.Uuid}: {ex.Message}");
+                    }
+                }
+
+                if (complete)
+                {
+                    CharacteristicCount = count;
+                    Debug.WriteLine($"[Tacx] Found {count} characteristic(s), {_otherCharacteristics.Count} additional.");
+                }
+                else
+                {
+                    _otherCharacteristics.Clear();
+                    Debug.WriteLine("[Tacx] GATT characteristic inventory incomplete.");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _otherCharacteristics.Clear();
+                Debug.WriteLine($"[Tacx] GATT characteristic discovery unavailable: {ex.Message}");
+            }
+        }
+
+        public async Task<int> SampleOtherCharacteristicsAsync(CancellationToken cancellationToken = default)
+        {
+            int sampled = 0;
+            foreach (var characteristic in _otherCharacteristics.ToArray())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if ((characteristic.Properties & GattCharacteristicProperties.Read) == 0)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var value = await characteristic.ReadValueAsync();
+                    if (value != null && _device != null)
+                    {
+                        RawDataReceived?.Invoke(this, new RawDeviceData(
+                            DateTimeOffset.UtcNow,
+                            "trainer",
+                            _device?.Name ?? "Tacx Trainer",
+                            "sample",
+                            characteristic.Service.Uuid,
+                            characteristic.Uuid,
+                            (byte[])value.Clone()));
+                        sampled++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[Tacx] Unable to sample {characteristic.Uuid}: {ex.Message}");
+                }
+            }
+
+            return sampled;
+        }
+
+        private void CscMeasurementCharacteristic_ValueChanged(object? sender, GattCharacteristicValueChangedEventArgs e)
+        {
+            try
+            {
+                byte[]? data = e.Value;
+                if (data != null && data.Length > 0)
+                {
+                    RawDataReceived?.Invoke(this, new RawDeviceData(
+                        DateTimeOffset.UtcNow,
+                        "trainer",
+                        _device?.Name ?? "Tacx Trainer",
+                        "notification",
+                        CyclingSpeedCadenceServiceUuid,
+                        CscMeasurementUuid,
+                        (byte[])data.Clone()));
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Tacx] CSC notification handler error: {ex.Message}");
+            }
         }
 
         private void IndoorBikeDataCharacteristic_ValueChanged(object? sender, GattCharacteristicValueChangedEventArgs e)

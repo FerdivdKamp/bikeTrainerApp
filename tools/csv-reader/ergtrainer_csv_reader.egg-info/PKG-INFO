@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: ergtrainer-csv-reader
+Version: 0.1.0
+Summary: Jupyter tools for inspecting ErgTrainer recording CSV files.
+Requires-Python: >=3.10
+Requires-Dist: ipywidgets>=8.0
+Requires-Dist: jupyterlab>=4.0
+Requires-Dist: matplotlib>=3.8
+Requires-Dist: pandas>=2.0

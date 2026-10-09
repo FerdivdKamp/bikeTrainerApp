@@ -151,7 +151,7 @@ namespace ErgTrainer
             {
                 Text = "Power: -- W | Cadence: -- rpm | Speed: -- kph",
                 Left = 10,
-                Top = 85,
+                Top = 100,
                 AutoSize = true
             };
 
@@ -363,7 +363,7 @@ namespace ErgTrainer
 
         #endregion
 
-        private void ChkRecordSignals_CheckedChanged(object? sender, EventArgs e)
+        private async void ChkRecordSignals_CheckedChanged(object? sender, EventArgs e)
         {
             if (_changingRecordingState)
             {
@@ -376,6 +376,7 @@ namespace ErgTrainer
                 {
                     var filePath = _signalRecorder.StartRecording();
                     _lblRecordingStatus.Text = $"Recording: {filePath}";
+                    await SampleTrainerCharacteristicsAsync();
                 }
                 else
                 {
@@ -390,6 +391,24 @@ namespace ErgTrainer
                 _changingRecordingState = false;
                 _lblRecordingStatus.Text = "Recording: failed";
                 MessageBox.Show($"Unable to start recording: {ex.Message}", "Recording Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private async Task SampleTrainerCharacteristicsAsync()
+        {
+            if (_tacxTrainer.CharacteristicCount is null || !_signalRecorder.IsRecording)
+            {
+                return;
+            }
+
+            try
+            {
+                int sampled = await _tacxTrainer.SampleOtherCharacteristicsAsync();
+                Debug.WriteLine($"[MainForm] Sampled {sampled} additional trainer characteristic(s).");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[MainForm] Unable to sample trainer characteristics: {ex.Message}");
             }
         }
 
@@ -416,9 +435,14 @@ namespace ErgTrainer
                 bool ok = await _tacxTrainer.ConnectToDeviceAsync(device);
                 if (ok)
                 {
-                    _lblTacxStatus.Text = $"Status: connected to {device.Name ?? "trainer"}";
+                    string cscStatus = _tacxTrainer.HasCyclingSpeedCadenceNotifications ? "on" : "unavailable";
+                    string gattStatus = _tacxTrainer.CharacteristicCount is int count
+                        ? $"GATT: {count} total, {_tacxTrainer.OtherCharacteristicCount} other"
+                        : "GATT: discovery unavailable";
+                    _lblTacxStatus.Text = $"Status: {device.Name ?? "trainer"} | CSC: {cscStatus}\n{gattStatus}";
                     _btnDisconnectTacx.Enabled = true;
                     _lblTacxData.Text = "Power: -- W | Cadence: -- rpm | Speed: -- kph";
+                    await SampleTrainerCharacteristicsAsync();
                     
                     // Don't start chart recording automatically - wait for timer start
                     
