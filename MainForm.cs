@@ -29,8 +29,14 @@ namespace ErgTrainer
         // Tacx Trainer Section
         private readonly GroupBox _grpTacx;
         private readonly Button _btnDisconnectTacx;
+        private readonly Button _btnTestFtmsControl;
+        private readonly Button _btnSetTargetPower;
+        private readonly NumericUpDown _targetPower;
+        private readonly Label _targetPowerLabel;
         private readonly Label _lblTacxStatus;
         private readonly Label _lblTacxData;
+        private readonly Label _lblFtmsControlResponse;
+        private readonly NumericUpDown _wheelCircumference;
 
         // HRM Section
         private readonly GroupBox _grpHrm;
@@ -127,7 +133,7 @@ namespace ErgTrainer
                 Left = 340,
                 Top = 20,
                 Width = 330,
-                Height = 200
+                Height = 250
             };
 
             _btnDisconnectTacx = new Button
@@ -151,15 +157,89 @@ namespace ErgTrainer
             {
                 Text = "Power: -- W | Cadence: -- rpm | Speed: -- kph",
                 Left = 10,
-                Top = 85,
+                Top = 100,
                 AutoSize = true
+            };
+
+            _btnTestFtmsControl = new Button
+            {
+                Text = "Test FTMS control",
+                Left = 10,
+                Top = 130,
+                Width = 150,
+                Enabled = false,
+                Visible = false
+            };
+
+            _targetPowerLabel = new Label
+            {
+                Text = "ERG watts:",
+                Left = 10,
+                Top = 134,
+                AutoSize = true,
+                Visible = false
+            };
+            _targetPower = new NumericUpDown
+            {
+                Left = 85,
+                Top = 130,
+                Width = 70,
+                Minimum = 0,
+                Maximum = 1000,
+                Value = 150,
+                Visible = false
+            };
+            _btnSetTargetPower = new Button
+            {
+                Text = "Set ERG target",
+                Left = 165,
+                Top = 130,
+                Width = 150,
+                Enabled = false,
+                Visible = false
+            };
+
+            var wheelCircumferenceLabel = new Label
+            {
+                Text = "Wheel mm:",
+                Left = 10,
+                Top = 169,
+                AutoSize = true
+            };
+
+            _wheelCircumference = new NumericUpDown
+            {
+                Left = 85,
+                Top = 165,
+                Width = 75,
+                Minimum = 500,
+                Maximum = 4000,
+                Value = _tacxTrainer.WheelCircumferenceMm
+            };
+            _wheelCircumference.ValueChanged += (_, _) =>
+                _tacxTrainer.WheelCircumferenceMm = (int)_wheelCircumference.Value;
+
+            _lblFtmsControlResponse = new Label
+            {
+                Text = "Control: not connected",
+                Left = 10,
+                Top = 205,
+                Width = 300,
+                Height = 40
             };
 
             _grpTacx.Controls.AddRange(new Control[]
             {
                 _btnDisconnectTacx,
                 _lblTacxStatus,
-                _lblTacxData
+                _lblTacxData,
+                _btnTestFtmsControl,
+                _targetPowerLabel,
+                _targetPower,
+                _btnSetTargetPower,
+                wheelCircumferenceLabel,
+                _wheelCircumference,
+                _lblFtmsControlResponse
             });
 
             // HRM Section
@@ -167,7 +247,7 @@ namespace ErgTrainer
             {
                 Text = "Heart Rate Monitor",
                 Left = 340,
-                Top = 240,
+                Top = 290,
                 Width = 330,
                 Height = 200
             };
@@ -259,7 +339,7 @@ namespace ErgTrainer
             {
                 Text = "Training Timer",
                 Left = 340,
-                Top = 460,
+                Top = 510,
                 Width = 330,
                 Height = 120
             };
@@ -288,6 +368,8 @@ namespace ErgTrainer
             _btnScan.Click += BtnScan_Click;
             _listDevices.DoubleClick += ListDevices_DoubleClick;
             _btnDisconnectTacx.Click += BtnDisconnectTacx_Click;
+            _btnTestFtmsControl.Click += BtnTestFtmsControl_Click;
+            _btnSetTargetPower.Click += BtnSetTargetPower_Click;
             _btnDisconnectHrm.Click += BtnDisconnectHrm_Click;
             _chkRecordSignals.CheckedChanged += ChkRecordSignals_CheckedChanged;
         }
@@ -363,7 +445,7 @@ namespace ErgTrainer
 
         #endregion
 
-        private void ChkRecordSignals_CheckedChanged(object? sender, EventArgs e)
+        private async void ChkRecordSignals_CheckedChanged(object? sender, EventArgs e)
         {
             if (_changingRecordingState)
             {
@@ -376,6 +458,7 @@ namespace ErgTrainer
                 {
                     var filePath = _signalRecorder.StartRecording();
                     _lblRecordingStatus.Text = $"Recording: {filePath}";
+                    await SampleTrainerCharacteristicsAsync();
                 }
                 else
                 {
@@ -390,6 +473,24 @@ namespace ErgTrainer
                 _changingRecordingState = false;
                 _lblRecordingStatus.Text = "Recording: failed";
                 MessageBox.Show($"Unable to start recording: {ex.Message}", "Recording Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private async Task SampleTrainerCharacteristicsAsync()
+        {
+            if (_tacxTrainer.CharacteristicCount is null || !_signalRecorder.IsRecording)
+            {
+                return;
+            }
+
+            try
+            {
+                int sampled = await _tacxTrainer.SampleOtherCharacteristicsAsync();
+                Debug.WriteLine($"[MainForm] Sampled {sampled} additional trainer characteristic(s).");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[MainForm] Unable to sample trainer characteristics: {ex.Message}");
             }
         }
 
@@ -416,9 +517,21 @@ namespace ErgTrainer
                 bool ok = await _tacxTrainer.ConnectToDeviceAsync(device);
                 if (ok)
                 {
-                    _lblTacxStatus.Text = $"Status: connected to {device.Name ?? "trainer"}";
+                    string cscStatus = _tacxTrainer.HasCyclingSpeedCadenceNotifications ? "on" : "unavailable";
+                    _lblTacxStatus.Text = $"Status: {device.Name ?? "trainer"} | CSC: {cscStatus}\nControl: {_tacxTrainer.ControlMethod}";
                     _btnDisconnectTacx.Enabled = true;
+                    bool fec = _tacxTrainer.ControlMethod == "Tacx FE-C over BLE";
+                    bool ftms = _tacxTrainer.ControlMethod == "FTMS";
+                    _btnSetTargetPower.Visible = fec;
+                    _btnSetTargetPower.Enabled = fec;
+                    _targetPower.Visible = fec;
+                    _targetPowerLabel.Visible = fec;
+                    _btnTestFtmsControl.Visible = ftms;
+                    _btnTestFtmsControl.Enabled = ftms;
+                    _lblFtmsControlResponse.Text = fec ? "Control: ready to set ERG target" :
+                        ftms ? "Control: FTMS test available" : "Control: unavailable";
                     _lblTacxData.Text = "Power: -- W | Cadence: -- rpm | Speed: -- kph";
+                    await SampleTrainerCharacteristicsAsync();
                     
                     // Don't start chart recording automatically - wait for timer start
                     
@@ -447,12 +560,86 @@ namespace ErgTrainer
             await _tacxTrainer.DisconnectAsync();
             _lblTacxStatus.Text = "Status: trainer disconnected";
             _btnDisconnectTacx.Enabled = false;
+            _btnTestFtmsControl.Enabled = false;
+            _btnTestFtmsControl.Visible = false;
+            _btnSetTargetPower.Enabled = false;
+            _btnSetTargetPower.Visible = false;
+            _targetPower.Visible = false;
+            _targetPowerLabel.Visible = false;
+            _lblFtmsControlResponse.Text = "Control: not connected";
             _lblTacxData.Text = "Power: -- W | Cadence: -- rpm | Speed: -- kph";
             
             // Stop chart recording
             _chartPower.StopRecording();
             _chartCadence.StopRecording();
             _chartSpeed.StopRecording();
+        }
+
+        private async void BtnTestFtmsControl_Click(object? sender, EventArgs e)
+        {
+            _btnTestFtmsControl.Enabled = false;
+            _lblFtmsControlResponse.Text = "Control test: waiting for reply...";
+
+            try
+            {
+                string result = await _tacxTrainer.TestFtmsControlAsync();
+                if (!IsDisposed)
+                {
+                    _lblFtmsControlResponse.Text = result;
+                    MessageBox.Show(result, "FTMS Control Test", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+            catch (TimeoutException)
+            {
+                if (!IsDisposed)
+                {
+                    _lblFtmsControlResponse.Text = "Control test: no response within 5 seconds";
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[MainForm] FTMS control test failed: {ex}");
+                if (!IsDisposed)
+                {
+                    _lblFtmsControlResponse.Text = $"Control test failed: {ex.Message}";
+                    MessageBox.Show(ex.Message, "FTMS Control Test", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+            finally
+            {
+                if (!IsDisposed)
+                {
+                    _btnTestFtmsControl.Enabled = _btnDisconnectTacx.Enabled;
+                }
+            }
+        }
+
+        private async void BtnSetTargetPower_Click(object? sender, EventArgs e)
+        {
+            _btnSetTargetPower.Enabled = false;
+            int watts = (int)_targetPower.Value;
+            _lblFtmsControlResponse.Text = $"Control: sending {watts} W target...";
+            try
+            {
+                _lblFtmsControlResponse.Text = await _tacxTrainer.SetTargetPowerAsync(watts);
+            }
+            catch (TimeoutException)
+            {
+                _lblFtmsControlResponse.Text = "Control: no FE-C command status within 5 seconds";
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[MainForm] FE-C ERG command failed: {ex}");
+                _lblFtmsControlResponse.Text = $"Control failed: {ex.Message}";
+            }
+            finally
+            {
+                if (!IsDisposed)
+                {
+                    _btnSetTargetPower.Enabled = _btnDisconnectTacx.Enabled &&
+                        _tacxTrainer.ControlMethod == "Tacx FE-C over BLE";
+                }
+            }
         }
 
         private void TacxTrainer_DataUpdated(object? sender, TrainerData data)
@@ -463,15 +650,23 @@ namespace ErgTrainer
                 return;
             }
 
-            _lblTacxData.Text = $"Power: {data.PowerWatts:F0} W | Cadence: {data.CadenceRpm:F0} rpm | Speed: {data.SpeedKph:F1} kph";
+            string cadence = data.CadenceRpm?.ToString("F0") ?? "--";
+            string speed = data.SpeedKph?.ToString("F1") ?? "--";
+            _lblTacxData.Text = $"Power: {data.PowerWatts:F0} W | Cadence: {cadence} rpm | Speed: {speed} kph";
             
             // Only update charts if timer is running and not paused
             if (_trainingTimer.IsRunning)
             {
                 var timestamp = DateTime.Now;
                 _chartPower.AddDataPoint(data.PowerWatts, timestamp);
-                _chartCadence.AddDataPoint(data.CadenceRpm, timestamp);
-                _chartSpeed.AddDataPoint(data.SpeedKph, timestamp);
+                if (data.CadenceRpm is double cadenceRpm)
+                {
+                    _chartCadence.AddDataPoint(cadenceRpm, timestamp);
+                }
+                if (data.SpeedKph is double speedKph)
+                {
+                    _chartSpeed.AddDataPoint(speedKph, timestamp);
+                }
             }
         }
 
@@ -577,6 +772,7 @@ namespace ErgTrainer
         protected override async void OnFormClosed(FormClosedEventArgs e)
         {
             _signalRecorder.Dispose();
+            _tacxTrainer.DataUpdated -= TacxTrainer_DataUpdated;
             _tacxTrainer.RawDataReceived -= Device_RawDataReceived;
             _hrmSensor.RawDataReceived -= Device_RawDataReceived;
             base.OnFormClosed(e);
