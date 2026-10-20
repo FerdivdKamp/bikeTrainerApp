@@ -36,11 +36,17 @@ namespace ErgTrainer.Sensors
         private static readonly Guid CscMeasurementUuid =
             Guid.Parse("00002a5b-0000-1000-8000-00805f9b34fb");
 
+        // Tacx FE-C over BLE uses the Tacx UART service, not the FTMS control point.
+        private static readonly Guid FecServiceUuid = Guid.Parse("6e40fec1-b5a3-f393-e0a9-e50e24dcca9e");
+        private static readonly Guid FecNotifyUuid = Guid.Parse("6e40fec2-b5a3-f393-e0a9-e50e24dcca9e");
+        private static readonly Guid FecWriteUuid = Guid.Parse("6e40fec3-b5a3-f393-e0a9-e50e24dcca9e");
+
         public string Name => "BLE Tacx Trainer";
 
         public event EventHandler<TrainerData>? DataUpdated;
         public event EventHandler<RawDeviceData>? RawDataReceived;
         public bool HasCyclingSpeedCadenceNotifications => _cscMeasurementCharacteristic != null;
+        public string ControlMethod { get; private set; } = "unavailable";
         public int WheelCircumferenceMm { get; set; } = 2105;
         public int? CharacteristicCount { get; private set; }
         public int OtherCharacteristicCount => _otherCharacteristics.Count;
@@ -50,6 +56,11 @@ namespace ErgTrainer.Sensors
         private GattCharacteristic? _indoorBikeDataCharacteristic;
         private GattService? _cscService;
         private GattCharacteristic? _cscMeasurementCharacteristic;
+        private GattService? _fecService;
+        private GattCharacteristic? _fecNotifyCharacteristic;
+        private GattCharacteristic? _fecWriteCharacteristic;
+        private readonly SemaphoreSlim _controlGate = new(1, 1);
+        private TaskCompletionSource<byte>? _pendingFecStatus;
         private CancellationTokenSource? _pollingCts;
         private readonly List<GattCharacteristic> _otherCharacteristics = new();
         private readonly object _measurementLock = new();
@@ -168,6 +179,7 @@ namespace ErgTrainer.Sensors
             _otherCharacteristics.Clear();
             CharacteristicCount = null;
             ResetMeasurements();
+            ControlMethod = "unavailable";
             _device = device;
 
             var gatt = _device.Gatt;
@@ -284,6 +296,8 @@ namespace ErgTrainer.Sensors
                 Debug.WriteLine($"[Tacx] CSC notifications unavailable: {ex.Message}");
             }
 
+            await DiscoverControlAsync(gatt);
+
             await DiscoverOtherCharacteristicsAsync(gatt, cancellationToken);
 
             Debug.WriteLine("[Tacx] Starting polling loop (as backup)...");
@@ -296,58 +310,233 @@ namespace ErgTrainer.Sensors
 
         public async Task DisconnectAsync()
         {
-            // stop our polling loop
-            _pollingCts?.Cancel();
-            _pollingCts = null;
-            _otherCharacteristics.Clear();
-            CharacteristicCount = null;
-            ResetMeasurements();
-
-            if (_cscMeasurementCharacteristic != null)
+            await _controlGate.WaitAsync();
+            try
             {
+                _pendingFecStatus?.TrySetCanceled();
+                _pendingFecStatus = null;
+                if (_fecNotifyCharacteristic != null)
+                {
+                    _fecNotifyCharacteristic.CharacteristicValueChanged -= FecNotifyCharacteristic_ValueChanged;
+                    try
+                    {
+                        await _fecNotifyCharacteristic.StopNotificationsAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[Tacx] Unable to stop FE-C notifications: {ex.Message}");
+                    }
+                }
+                _fecNotifyCharacteristic = null;
+                _fecWriteCharacteristic = null;
+                _fecService = null;
+                ControlMethod = "unavailable";
+
+                // stop our polling loop
+                _pollingCts?.Cancel();
+                _pollingCts = null;
+                _otherCharacteristics.Clear();
+                CharacteristicCount = null;
+                ResetMeasurements();
+
+                if (_cscMeasurementCharacteristic != null)
+                {
+                    try
+                    {
+                        _cscMeasurementCharacteristic.CharacteristicValueChanged -= CscMeasurementCharacteristic_ValueChanged;
+                        await _cscMeasurementCharacteristic.StopNotificationsAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[Tacx] Unable to stop CSC notifications: {ex.Message}");
+                    }
+
+                    _cscMeasurementCharacteristic = null;
+                }
+                _cscService = null;
+
+                if (_indoorBikeDataCharacteristic != null)
+                {
+                    try
+                    {
+                        _indoorBikeDataCharacteristic.CharacteristicValueChanged -= IndoorBikeDataCharacteristic_ValueChanged;
+                        await _indoorBikeDataCharacteristic.StopNotificationsAsync();
+                    }
+                    catch
+                    {
+                        // ignore errors on shutdown
+                    }
+
+                    _indoorBikeDataCharacteristic = null;
+                }
+
+                // we're done with the service too
+                _ftmsService = null;
+
+                // End the GATT session to release trainer control.
                 try
                 {
-                    _cscMeasurementCharacteristic.CharacteristicValueChanged -= CscMeasurementCharacteristic_ValueChanged;
-                    await _cscMeasurementCharacteristic.StopNotificationsAsync();
+                    _device?.Gatt.Disconnect();
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"[Tacx] Unable to stop CSC notifications: {ex.Message}");
+                    Debug.WriteLine($"[Tacx] Unable to disconnect GATT: {ex.Message}");
                 }
 
-                _cscMeasurementCharacteristic = null;
+                _device = null;
             }
-            _cscService = null;
-
-            if (_indoorBikeDataCharacteristic != null)
+            finally
             {
-                try
-                {
-                    _indoorBikeDataCharacteristic.CharacteristicValueChanged -= IndoorBikeDataCharacteristic_ValueChanged;
-                    await _indoorBikeDataCharacteristic.StopNotificationsAsync();
-                }
-                catch
-                {
-                    // ignore errors on shutdown
-                }
-
-                _indoorBikeDataCharacteristic = null;
+                _controlGate.Release();
             }
+        }
 
-            // we're done with the service too
-            _ftmsService = null;
-
-            // End the GATT session so any FTMS control permission is released.
+        private async Task DiscoverControlAsync(RemoteGattServer gatt)
+        {
             try
             {
-                _device?.Gatt.Disconnect();
+                _fecService = await gatt.GetPrimaryServiceAsync(FecServiceUuid);
+                if (_fecService != null)
+                {
+                    var notify = await _fecService.GetCharacteristicAsync(FecNotifyUuid);
+                    var write = await _fecService.GetCharacteristicAsync(FecWriteUuid);
+                    if (notify != null && write != null &&
+                        (notify.Properties & GattCharacteristicProperties.Notify) != 0 &&
+                        (write.Properties & (GattCharacteristicProperties.WriteWithoutResponse | GattCharacteristicProperties.Write)) != 0)
+                    {
+                        notify.CharacteristicValueChanged += FecNotifyCharacteristic_ValueChanged;
+                        try
+                        {
+                            await notify.StartNotificationsAsync();
+                            _fecNotifyCharacteristic = notify;
+                            _fecWriteCharacteristic = write;
+                            ControlMethod = "Tacx FE-C over BLE";
+                            return;
+                        }
+                        catch
+                        {
+                            notify.CharacteristicValueChanged -= FecNotifyCharacteristic_ValueChanged;
+                            throw;
+                        }
+                    }
+                    Debug.WriteLine("[Tacx] FE-C service lacks usable notify/write characteristics.");
+                }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[Tacx] Unable to disconnect GATT: {ex.Message}");
+                Debug.WriteLine($"[Tacx] FE-C control unavailable: {ex.Message}");
             }
 
-            _device = null;
+            _fecService = null;
+            if (_ftmsService?.Uuid == FitnessMachineServiceUuid)
+            {
+                try
+                {
+                    var controlPoint = await _ftmsService.GetCharacteristicAsync(FitnessMachineControlPointUuid);
+                    if (controlPoint != null &&
+                        (controlPoint.Properties & GattCharacteristicProperties.Write) != 0 &&
+                        (controlPoint.Properties & GattCharacteristicProperties.Indicate) != 0)
+                    {
+                        ControlMethod = "FTMS";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[Tacx] FTMS control discovery unavailable: {ex.Message}");
+                }
+            }
+        }
+
+        public async Task<string> SetTargetPowerAsync(int watts, CancellationToken cancellationToken = default)
+        {
+            if (watts < 0 || watts > 1000)
+            {
+                throw new ArgumentOutOfRangeException(nameof(watts), "Target power must be between 0 and 1000 W.");
+            }
+            if (!await _controlGate.WaitAsync(0, cancellationToken))
+            {
+                return "A trainer control operation is already in progress.";
+            }
+
+            try
+            {
+                var write = _fecWriteCharacteristic;
+                if (_device == null || write == null || _fecNotifyCharacteristic == null)
+                {
+                    return "Tacx FE-C over BLE control is unavailable on this connection.";
+                }
+
+                // FE-C acknowledged data page 49: target power in quarter-watt units.
+                ushort quarterWatts = (ushort)(watts * 4);
+                byte[] command = { 0xA4, 0x09, 0x4F, 0x05, 0x31,
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                    (byte)quarterWatts, (byte)(quarterWatts >> 8), 0x00 };
+                for (int i = 0; i < command.Length - 1; i++)
+                {
+                    command[12] ^= command[i];
+                }
+
+                var response = new TaskCompletionSource<byte>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _pendingFecStatus = response;
+                cancellationToken.ThrowIfCancellationRequested();
+                if ((write.Properties & GattCharacteristicProperties.WriteWithoutResponse) != 0)
+                {
+                    await write.WriteValueWithoutResponseAsync(command);
+                }
+                else
+                {
+                    await write.WriteValueWithResponseAsync(command);
+                }
+
+                byte status = await response.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken);
+                return status switch
+                {
+                    0 => $"Trainer accepted {watts} W ERG target.",
+                    1 => "Trainer reported that the ERG command failed. Another app may own control.",
+                    2 => "Trainer does not support the ERG command.",
+                    3 => "Trainer rejected the ERG command. Another app may own control.",
+                    4 => "Trainer is still processing the ERG command.",
+                    _ => $"Trainer returned unknown FE-C command status 0x{status:X2}."
+                };
+            }
+            finally
+            {
+                _pendingFecStatus = null;
+                _controlGate.Release();
+            }
+        }
+
+        private void FecNotifyCharacteristic_ValueChanged(object? sender, GattCharacteristicValueChangedEventArgs e)
+        {
+            if (e.Error != null)
+            {
+                _pendingFecStatus?.TrySetException(new InvalidOperationException($"FE-C notification failed: {e.Error}"));
+                return;
+            }
+
+            byte[]? data = e.Value;
+            if (data == null || data.Length != 13 || data[0] != 0xA4 || data[1] != 0x09 || data[3] != 0x05)
+            {
+                return;
+            }
+
+            byte checksum = 0;
+            foreach (byte value in data)
+            {
+                checksum ^= value;
+            }
+            if (checksum != 0)
+            {
+                Debug.WriteLine("[Tacx] Ignoring FE-C packet with invalid checksum.");
+                return;
+            }
+
+            // Command Status page 71: last command, sequence, result, then four data bytes.
+            if (data[4] == 0x47 && data[5] == 0x31)
+            {
+                Debug.WriteLine($"[Tacx] FE-C ERG command status: {Convert.ToHexString(data)}");
+                _pendingFecStatus?.TrySetResult(data[7]);
+            }
         }
 
         private async Task DiscoverOtherCharacteristicsAsync(RemoteGattServer gatt, CancellationToken token)
@@ -445,6 +634,23 @@ namespace ErgTrainer.Sensors
         }
 
         public async Task<string> TestFtmsControlAsync(CancellationToken cancellationToken = default)
+        {
+            if (!await _controlGate.WaitAsync(0, cancellationToken))
+            {
+                return "A trainer control operation is already in progress.";
+            }
+
+            try
+            {
+                return await TestFtmsControlCoreAsync(cancellationToken);
+            }
+            finally
+            {
+                _controlGate.Release();
+            }
+        }
+
+        private async Task<string> TestFtmsControlCoreAsync(CancellationToken cancellationToken)
         {
             if (_device == null || _ftmsService?.Uuid != FitnessMachineServiceUuid)
             {

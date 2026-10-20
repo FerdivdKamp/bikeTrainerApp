@@ -30,6 +30,9 @@ namespace ErgTrainer
         private readonly GroupBox _grpTacx;
         private readonly Button _btnDisconnectTacx;
         private readonly Button _btnTestFtmsControl;
+        private readonly Button _btnSetTargetPower;
+        private readonly NumericUpDown _targetPower;
+        private readonly Label _targetPowerLabel;
         private readonly Label _lblTacxStatus;
         private readonly Label _lblTacxData;
         private readonly Label _lblFtmsControlResponse;
@@ -130,7 +133,7 @@ namespace ErgTrainer
                 Left = 340,
                 Top = 20,
                 Width = 330,
-                Height = 200
+                Height = 250
             };
 
             _btnDisconnectTacx = new Button
@@ -164,21 +167,50 @@ namespace ErgTrainer
                 Left = 10,
                 Top = 130,
                 Width = 150,
-                Enabled = false
+                Enabled = false,
+                Visible = false
+            };
+
+            _targetPowerLabel = new Label
+            {
+                Text = "ERG watts:",
+                Left = 10,
+                Top = 134,
+                AutoSize = true,
+                Visible = false
+            };
+            _targetPower = new NumericUpDown
+            {
+                Left = 85,
+                Top = 130,
+                Width = 70,
+                Minimum = 0,
+                Maximum = 1000,
+                Value = 150,
+                Visible = false
+            };
+            _btnSetTargetPower = new Button
+            {
+                Text = "Set ERG target",
+                Left = 165,
+                Top = 130,
+                Width = 150,
+                Enabled = false,
+                Visible = false
             };
 
             var wheelCircumferenceLabel = new Label
             {
                 Text = "Wheel mm:",
-                Left = 170,
-                Top = 134,
+                Left = 10,
+                Top = 169,
                 AutoSize = true
             };
 
             _wheelCircumference = new NumericUpDown
             {
-                Left = 240,
-                Top = 130,
+                Left = 85,
+                Top = 165,
                 Width = 75,
                 Minimum = 500,
                 Maximum = 4000,
@@ -189,11 +221,11 @@ namespace ErgTrainer
 
             _lblFtmsControlResponse = new Label
             {
-                Text = "Control test: not run",
+                Text = "Control: not connected",
                 Left = 10,
-                Top = 165,
+                Top = 205,
                 Width = 300,
-                Height = 30
+                Height = 40
             };
 
             _grpTacx.Controls.AddRange(new Control[]
@@ -202,6 +234,9 @@ namespace ErgTrainer
                 _lblTacxStatus,
                 _lblTacxData,
                 _btnTestFtmsControl,
+                _targetPowerLabel,
+                _targetPower,
+                _btnSetTargetPower,
                 wheelCircumferenceLabel,
                 _wheelCircumference,
                 _lblFtmsControlResponse
@@ -212,7 +247,7 @@ namespace ErgTrainer
             {
                 Text = "Heart Rate Monitor",
                 Left = 340,
-                Top = 240,
+                Top = 290,
                 Width = 330,
                 Height = 200
             };
@@ -304,7 +339,7 @@ namespace ErgTrainer
             {
                 Text = "Training Timer",
                 Left = 340,
-                Top = 460,
+                Top = 510,
                 Width = 330,
                 Height = 120
             };
@@ -334,6 +369,7 @@ namespace ErgTrainer
             _listDevices.DoubleClick += ListDevices_DoubleClick;
             _btnDisconnectTacx.Click += BtnDisconnectTacx_Click;
             _btnTestFtmsControl.Click += BtnTestFtmsControl_Click;
+            _btnSetTargetPower.Click += BtnSetTargetPower_Click;
             _btnDisconnectHrm.Click += BtnDisconnectHrm_Click;
             _chkRecordSignals.CheckedChanged += ChkRecordSignals_CheckedChanged;
         }
@@ -482,13 +518,18 @@ namespace ErgTrainer
                 if (ok)
                 {
                     string cscStatus = _tacxTrainer.HasCyclingSpeedCadenceNotifications ? "on" : "unavailable";
-                    string gattStatus = _tacxTrainer.CharacteristicCount is int count
-                        ? $"GATT: {count} total, {_tacxTrainer.OtherCharacteristicCount} other"
-                        : "GATT: discovery unavailable";
-                    _lblTacxStatus.Text = $"Status: {device.Name ?? "trainer"} | CSC: {cscStatus}\n{gattStatus}";
+                    _lblTacxStatus.Text = $"Status: {device.Name ?? "trainer"} | CSC: {cscStatus}\nControl: {_tacxTrainer.ControlMethod}";
                     _btnDisconnectTacx.Enabled = true;
-                    _btnTestFtmsControl.Enabled = true;
-                    _lblFtmsControlResponse.Text = "Control test: not run";
+                    bool fec = _tacxTrainer.ControlMethod == "Tacx FE-C over BLE";
+                    bool ftms = _tacxTrainer.ControlMethod == "FTMS";
+                    _btnSetTargetPower.Visible = fec;
+                    _btnSetTargetPower.Enabled = fec;
+                    _targetPower.Visible = fec;
+                    _targetPowerLabel.Visible = fec;
+                    _btnTestFtmsControl.Visible = ftms;
+                    _btnTestFtmsControl.Enabled = ftms;
+                    _lblFtmsControlResponse.Text = fec ? "Control: ready to set ERG target" :
+                        ftms ? "Control: FTMS test available" : "Control: unavailable";
                     _lblTacxData.Text = "Power: -- W | Cadence: -- rpm | Speed: -- kph";
                     await SampleTrainerCharacteristicsAsync();
                     
@@ -520,7 +561,12 @@ namespace ErgTrainer
             _lblTacxStatus.Text = "Status: trainer disconnected";
             _btnDisconnectTacx.Enabled = false;
             _btnTestFtmsControl.Enabled = false;
-            _lblFtmsControlResponse.Text = "Control test: not run";
+            _btnTestFtmsControl.Visible = false;
+            _btnSetTargetPower.Enabled = false;
+            _btnSetTargetPower.Visible = false;
+            _targetPower.Visible = false;
+            _targetPowerLabel.Visible = false;
+            _lblFtmsControlResponse.Text = "Control: not connected";
             _lblTacxData.Text = "Power: -- W | Cadence: -- rpm | Speed: -- kph";
             
             // Stop chart recording
@@ -564,6 +610,34 @@ namespace ErgTrainer
                 if (!IsDisposed)
                 {
                     _btnTestFtmsControl.Enabled = _btnDisconnectTacx.Enabled;
+                }
+            }
+        }
+
+        private async void BtnSetTargetPower_Click(object? sender, EventArgs e)
+        {
+            _btnSetTargetPower.Enabled = false;
+            int watts = (int)_targetPower.Value;
+            _lblFtmsControlResponse.Text = $"Control: sending {watts} W target...";
+            try
+            {
+                _lblFtmsControlResponse.Text = await _tacxTrainer.SetTargetPowerAsync(watts);
+            }
+            catch (TimeoutException)
+            {
+                _lblFtmsControlResponse.Text = "Control: no FE-C command status within 5 seconds";
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[MainForm] FE-C ERG command failed: {ex}");
+                _lblFtmsControlResponse.Text = $"Control failed: {ex.Message}";
+            }
+            finally
+            {
+                if (!IsDisposed)
+                {
+                    _btnSetTargetPower.Enabled = _btnDisconnectTacx.Enabled &&
+                        _tacxTrainer.ControlMethod == "Tacx FE-C over BLE";
                 }
             }
         }

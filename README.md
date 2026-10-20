@@ -24,6 +24,25 @@ virtual wheel, so choose a circumference that gives a useful estimate for your
 setup. Cadence or speed shows `--` until enough CSC events have arrived, or when
 the corresponding CSC field is unavailable.
 
+## Bluetooth ERG control
+
+For an original Tacx NEO Smart that exposes Tacx FE-C over BLE, connect the
+trainer, enter a target in **ERG watts** (0 to 1000 W), and select **Set ERG
+target**. The status reports whether the trainer accepted the command. Start
+with a modest target such as 150 W and pedal to check the actual resistance;
+an accepted command alone does not verify the physical result. Disconnect the
+trainer to release the BLE connection and control. Close other trainer apps if
+the command is rejected or no status arrives.
+
+The legacy command follows the [Tacx/Kinomap BleTrainerControl GitHub example](https://github.com/jedla22/BleTrainerControl)
+(see its [control implementation](https://github.com/jedla22/BleTrainerControl/blob/master/BleTrainerControl/BTLETrainerManager.m)
+and [FE-C over BLE guide](https://github.com/jedla22/BleTrainerControl/blob/master/How-to%20FE-C%20over%20BLE%20v1_0_0.pdf)):
+service `6e40fec1`, notifications `6e40fec2`, writes `6e40fec3`, target-power
+page 49 and command-status page 71. There is no separate request-control opcode
+in this legacy example; the target-power command requests a mode change and
+its status reports acceptance or rejection. Trainers exposing FTMS retain the
+**Test FTMS control** action instead.
+
 ## Raw signal recording
 
 Raw recording preserves the incoming BLE payload before the application attempts
