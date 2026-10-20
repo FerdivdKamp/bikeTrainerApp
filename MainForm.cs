@@ -33,6 +33,7 @@ namespace ErgTrainer
         private readonly Label _lblTacxStatus;
         private readonly Label _lblTacxData;
         private readonly Label _lblFtmsControlResponse;
+        private readonly NumericUpDown _wheelCircumference;
 
         // HRM Section
         private readonly GroupBox _grpHrm;
@@ -166,6 +167,26 @@ namespace ErgTrainer
                 Enabled = false
             };
 
+            var wheelCircumferenceLabel = new Label
+            {
+                Text = "Wheel mm:",
+                Left = 170,
+                Top = 134,
+                AutoSize = true
+            };
+
+            _wheelCircumference = new NumericUpDown
+            {
+                Left = 240,
+                Top = 130,
+                Width = 75,
+                Minimum = 500,
+                Maximum = 4000,
+                Value = _tacxTrainer.WheelCircumferenceMm
+            };
+            _wheelCircumference.ValueChanged += (_, _) =>
+                _tacxTrainer.WheelCircumferenceMm = (int)_wheelCircumference.Value;
+
             _lblFtmsControlResponse = new Label
             {
                 Text = "Control test: not run",
@@ -181,6 +202,8 @@ namespace ErgTrainer
                 _lblTacxStatus,
                 _lblTacxData,
                 _btnTestFtmsControl,
+                wheelCircumferenceLabel,
+                _wheelCircumference,
                 _lblFtmsControlResponse
             });
 
@@ -553,15 +576,23 @@ namespace ErgTrainer
                 return;
             }
 
-            _lblTacxData.Text = $"Power: {data.PowerWatts:F0} W | Cadence: {data.CadenceRpm:F0} rpm | Speed: {data.SpeedKph:F1} kph";
+            string cadence = data.CadenceRpm?.ToString("F0") ?? "--";
+            string speed = data.SpeedKph?.ToString("F1") ?? "--";
+            _lblTacxData.Text = $"Power: {data.PowerWatts:F0} W | Cadence: {cadence} rpm | Speed: {speed} kph";
             
             // Only update charts if timer is running and not paused
             if (_trainingTimer.IsRunning)
             {
                 var timestamp = DateTime.Now;
                 _chartPower.AddDataPoint(data.PowerWatts, timestamp);
-                _chartCadence.AddDataPoint(data.CadenceRpm, timestamp);
-                _chartSpeed.AddDataPoint(data.SpeedKph, timestamp);
+                if (data.CadenceRpm is double cadenceRpm)
+                {
+                    _chartCadence.AddDataPoint(cadenceRpm, timestamp);
+                }
+                if (data.SpeedKph is double speedKph)
+                {
+                    _chartSpeed.AddDataPoint(speedKph, timestamp);
+                }
             }
         }
 
@@ -667,6 +698,7 @@ namespace ErgTrainer
         protected override async void OnFormClosed(FormClosedEventArgs e)
         {
             _signalRecorder.Dispose();
+            _tacxTrainer.DataUpdated -= TacxTrainer_DataUpdated;
             _tacxTrainer.RawDataReceived -= Device_RawDataReceived;
             _hrmSensor.RawDataReceived -= Device_RawDataReceived;
             base.OnFormClosed(e);

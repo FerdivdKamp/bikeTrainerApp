@@ -41,6 +41,7 @@ namespace ErgTrainer.Sensors
         public event EventHandler<TrainerData>? DataUpdated;
         public event EventHandler<RawDeviceData>? RawDataReceived;
         public bool HasCyclingSpeedCadenceNotifications => _cscMeasurementCharacteristic != null;
+        public int WheelCircumferenceMm { get; set; } = 2105;
         public int? CharacteristicCount { get; private set; }
         public int OtherCharacteristicCount => _otherCharacteristics.Count;
 
@@ -51,6 +52,12 @@ namespace ErgTrainer.Sensors
         private GattCharacteristic? _cscMeasurementCharacteristic;
         private CancellationTokenSource? _pollingCts;
         private readonly List<GattCharacteristic> _otherCharacteristics = new();
+        private readonly object _measurementLock = new();
+        private TrainerData? _latestPrimaryData;
+        private (uint Revolutions, ushort Ticks)? _previousWheel;
+        private (ushort Revolutions, ushort Ticks)? _previousCrank;
+        private double? _cscSpeedKph;
+        private double? _cscCadenceRpm;
 
         /// <summary>
         /// Checks if a device is a Tacx trainer by checking for the Fitness Machine Service.
@@ -160,6 +167,7 @@ namespace ErgTrainer.Sensors
 
             _otherCharacteristics.Clear();
             CharacteristicCount = null;
+            ResetMeasurements();
             _device = device;
 
             var gatt = _device.Gatt;
@@ -293,6 +301,7 @@ namespace ErgTrainer.Sensors
             _pollingCts = null;
             _otherCharacteristics.Clear();
             CharacteristicCount = null;
+            ResetMeasurements();
 
             if (_cscMeasurementCharacteristic != null)
             {
@@ -513,11 +522,102 @@ namespace ErgTrainer.Sensors
                         CyclingSpeedCadenceServiceUuid,
                         CscMeasurementUuid,
                         (byte[])data.Clone()));
+                    var trainerData = ParseCscMeasurement(data);
+                    if (trainerData != null)
+                    {
+                        DataUpdated?.Invoke(this, trainerData);
+                    }
                 }
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"[Tacx] CSC notification handler error: {ex.Message}");
+            }
+        }
+
+        private void ResetMeasurements()
+        {
+            lock (_measurementLock)
+            {
+                _latestPrimaryData = null;
+                _previousWheel = null;
+                _previousCrank = null;
+                _cscSpeedKph = null;
+                _cscCadenceRpm = null;
+            }
+        }
+
+        private TrainerData UpdatePrimaryMeasurement(TrainerData data)
+        {
+            lock (_measurementLock)
+            {
+                _latestPrimaryData = data;
+                return data with
+                {
+                    SpeedKph = _cscSpeedKph ?? data.SpeedKph,
+                    CadenceRpm = _cscCadenceRpm ?? data.CadenceRpm
+                };
+            }
+        }
+
+        private TrainerData? ParseCscMeasurement(byte[] data)
+        {
+            byte flags = data[0];
+            if ((flags & ~0x03) != 0 || data.Length < 1 + ((flags & 1) != 0 ? 6 : 0) + ((flags & 2) != 0 ? 4 : 0))
+            {
+                Debug.WriteLine("[Tacx] Invalid CSC measurement.");
+                return null;
+            }
+
+            int offset = 1;
+            lock (_measurementLock)
+            {
+                if ((flags & 1) != 0)
+                {
+                    uint revolutions = BitConverter.ToUInt32(data, offset);
+                    ushort ticks = BitConverter.ToUInt16(data, offset + 4);
+                    if (_previousWheel is { } previous)
+                    {
+                        uint delta = unchecked(revolutions - previous.Revolutions);
+                        ushort elapsed = unchecked((ushort)(ticks - previous.Ticks));
+                        _cscSpeedKph = delta == 0 ? 0 : elapsed > 0
+                            ? delta * WheelCircumferenceMm * 0.0036 * 1024 / elapsed
+                            : null;
+                    }
+                    _previousWheel = (revolutions, ticks);
+                    offset += 6;
+                }
+                else
+                {
+                    _previousWheel = null;
+                    _cscSpeedKph = null;
+                }
+
+                if ((flags & 2) != 0)
+                {
+                    ushort revolutions = BitConverter.ToUInt16(data, offset);
+                    ushort ticks = BitConverter.ToUInt16(data, offset + 2);
+                    if (_previousCrank is { } previous)
+                    {
+                        ushort delta = unchecked((ushort)(revolutions - previous.Revolutions));
+                        ushort elapsed = unchecked((ushort)(ticks - previous.Ticks));
+                        _cscCadenceRpm = delta == 0 ? 0 : elapsed > 0
+                            ? delta * 60.0 * 1024 / elapsed
+                            : null;
+                    }
+                    _previousCrank = (revolutions, ticks);
+                }
+                else
+                {
+                    _previousCrank = null;
+                    _cscCadenceRpm = null;
+                }
+
+                return _latestPrimaryData is { } primary ? primary with
+                {
+                    SpeedKph = _cscSpeedKph ?? primary.SpeedKph,
+                    CadenceRpm = _cscCadenceRpm ?? primary.CadenceRpm
+                } : null;
             }
         }
 
@@ -540,6 +640,7 @@ namespace ErgTrainer.Sensors
                     var trainerData = ParseIndoorBikeData(data);
                     if (trainerData != null)
                     {
+                        trainerData = UpdatePrimaryMeasurement(trainerData);
                         Debug.WriteLine($"[Tacx] Parsed: Power={trainerData.PowerWatts:F0}W, Cadence={trainerData.CadenceRpm:F0}rpm, Speed={trainerData.SpeedKph:F1}kph");
                         DataUpdated?.Invoke(this, trainerData);
                     }
@@ -579,6 +680,7 @@ namespace ErgTrainer.Sensors
                         var trainerData = ParseIndoorBikeData(data);
                         if (trainerData != null)
                         {
+                            trainerData = UpdatePrimaryMeasurement(trainerData);
                             Debug.WriteLine($"[Tacx] Poll parsed: Power={trainerData.PowerWatts:F0}W, Cadence={trainerData.CadenceRpm:F0}rpm, Speed={trainerData.SpeedKph:F1}kph");
                             DataUpdated?.Invoke(this, trainerData);
                         }
@@ -623,53 +725,19 @@ namespace ErgTrainer.Sensors
 
         private TrainerData? ParseIndoorBikeData(byte[] data)
         {
-            // Check if this is Cycling Power Service data or FTMS data
-            // Cycling Power Measurement typically starts with flags, FTMS has different structure
-            if (data.Length < 2) return null;
-
-            // Detect format based on data structure:
-            // FTMS: single byte flag (0x03, 0x07, etc. - typically < 0x10 for first byte)
-            // Cycling Power: 2-byte flags (typically 0x0000-0xFFFF, but often starts with 0x00XX or 0xXX00)
-            bool looksLikeFtms = data[0] < 0x20; // FTMS flags are typically small values
-            
-            TrainerData? ftmsResult = null;
-            TrainerData? cyclingPowerResult = null;
-            
-            if (looksLikeFtms)
+            // The connected characteristic identifies the wire format. Cycling Power flags
+            // can start with the same bytes as FTMS flags.
+            if (_indoorBikeDataCharacteristic?.Uuid == CyclingPowerMeasurementUuid)
             {
-                // Try FTMS first (most common for Tacx Neo)
-                Debug.WriteLine("[Tacx] Data looks like FTMS format, parsing as FTMS");
-                ftmsResult = ParseFtmsData(data);
-                if (ftmsResult != null && (ftmsResult.SpeedKph > 0 || ftmsResult.PowerWatts > 0 || ftmsResult.CadenceRpm > 0))
-                {
-                    Debug.WriteLine($"[Tacx] Using FTMS result: Speed={ftmsResult.SpeedKph:F2}kph, Cadence={ftmsResult.CadenceRpm:F1}rpm, Power={ftmsResult.PowerWatts:F0}W");
-                    return ftmsResult;
-                }
-            }
-            
-            // Fall back to Cycling Power format
-            Debug.WriteLine("[Tacx] Trying Cycling Power Service format");
-            cyclingPowerResult = ParseCyclingPowerData(data);
-            if (cyclingPowerResult != null && (cyclingPowerResult.SpeedKph > 0 || cyclingPowerResult.PowerWatts > 0 || cyclingPowerResult.CadenceRpm > 0))
-            {
-                Debug.WriteLine($"[Tacx] Using Cycling Power result: Speed={cyclingPowerResult.SpeedKph:F2}kph, Cadence={cyclingPowerResult.CadenceRpm:F1}rpm, Power={cyclingPowerResult.PowerWatts:F0}W");
-                return cyclingPowerResult;
-            }
-            
-            // If FTMS wasn't tried yet, try it now
-            if (!looksLikeFtms)
-            {
-                Debug.WriteLine("[Tacx] Also trying FTMS format");
-                ftmsResult = ParseFtmsData(data);
-                if (ftmsResult != null && (ftmsResult.SpeedKph > 0 || ftmsResult.PowerWatts > 0 || ftmsResult.CadenceRpm > 0))
-                {
-                    Debug.WriteLine($"[Tacx] Using FTMS result: Speed={ftmsResult.SpeedKph:F2}kph, Cadence={ftmsResult.CadenceRpm:F1}rpm, Power={ftmsResult.PowerWatts:F0}W");
-                    return ftmsResult;
-                }
+                return ParseCyclingPowerData(data);
             }
 
-            // Return whichever gave us at least some data
-            return ftmsResult ?? cyclingPowerResult;
+            if (_indoorBikeDataCharacteristic?.Uuid == IndoorBikeDataUuid)
+            {
+                return ParseFtmsData(data);
+            }
+
+            return null;
         }
 
         private TrainerData? ParseFtmsData(byte[] data)
@@ -941,7 +1009,7 @@ namespace ErgTrainer.Sensors
         {
             // Cycling Power Measurement data parser
             // Format: Flags (2 bytes) + [optional fields based on flags]
-            if (data.Length < 2) return null;
+            if (data.Length < 4) return null;
 
             ushort flags = BitConverter.ToUInt16(data, 0);
             bool pedalPowerBalancePresent = (flags & 0x01) != 0;
@@ -959,16 +1027,10 @@ namespace ErgTrainer.Sensors
 
             int offset = 2;
             double powerWatts = 0;
-            double cadenceRpm = 0;
-            double speedKph = 0;
-
             // Instantaneous Power (always present, 2 bytes, signed)
-            if (data.Length >= offset + 2)
-            {
-                short power = BitConverter.ToInt16(data, offset);
-                powerWatts = power;
-                offset += 2;
-            }
+            short power = BitConverter.ToInt16(data, offset);
+            powerWatts = power;
+            offset += 2;
 
             // Pedal Power Balance (if present)
             if (pedalPowerBalancePresent && data.Length >= offset + 1)
@@ -1007,12 +1069,12 @@ namespace ErgTrainer.Sensors
                 Connected: true,
                 DeviceName: _device?.Name ?? "Tacx Trainer",
                 PowerWatts: powerWatts,
-                CadenceRpm: cadenceRpm,
-                SpeedKph: speedKph
+                CadenceRpm: null,
+                SpeedKph: null
             );
         }
     }
 
-    public record TrainerData(bool Connected, string DeviceName, double PowerWatts, double CadenceRpm, double SpeedKph);
+    public record TrainerData(bool Connected, string DeviceName, double PowerWatts, double? CadenceRpm, double? SpeedKph);
 }
 

@@ -13,6 +13,17 @@ The application targets Windows and x86.
 
 You can also open ergtrainer.sln in Visual Studio and start it with F5.
 
+## Trainer cadence and estimated speed
+
+When the trainer provides Cycling Speed and Cadence (CSC) notifications, cadence
+comes from crank revolutions and speed comes from wheel revolutions. The wheel
+speed is an estimate based on the **Wheel mm** value in the Tacx Trainer panel.
+It defaults to 2105 mm, matching the value used in the recording notebook; you
+can change it while the app is running. A direct-drive trainer may report a
+virtual wheel, so choose a circumference that gives a useful estimate for your
+setup. Cadence or speed shows `--` until enough CSC events have arrived, or when
+the corresponding CSC field is unavailable.
+
 ## Raw signal recording
 
 Raw recording preserves the incoming BLE payload before the application attempts
