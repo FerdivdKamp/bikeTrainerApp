@@ -259,7 +259,15 @@ namespace ErgTrainer.Sensors
             // we’re done with the service too
             _hrService = null;
 
-            // drop the device reference – 32feet will clean up native objects
+            try
+            {
+                _device?.Gatt.Disconnect();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[BLE] HRM GATT disconnect failed: {ex.Message}");
+            }
+
             _device = null;
         }
 
@@ -298,7 +306,10 @@ namespace ErgTrainer.Sensors
 
         private void HrCharacteristic_ValueChanged(object? sender, GattCharacteristicValueChangedEventArgs e)
         {
-            ProcessHeartRateData(e.Value, "notification");
+            if (e.Value is byte[] data)
+            {
+                ProcessHeartRateData(data, "notification");
+            }
         }
 
         private void ProcessHeartRateData(byte[] data, string deliveryMethod)

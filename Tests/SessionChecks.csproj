@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\Sessions\TrainingSession.cs" Link="TrainingSession.cs" />
+    <Compile Include="..\Sessions\SessionClock.cs" Link="SessionClock.cs" />
+    <Compile Include="..\Sensors\FecSimulationPackets.cs" Link="FecSimulationPackets.cs" />
+  </ItemGroup>
+</Project>

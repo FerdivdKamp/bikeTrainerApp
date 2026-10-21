@@ -21,6 +21,7 @@ namespace ErgTrainer.Controls
         public event EventHandler? Stopped;
 
         public bool IsRunning => _stopwatch.IsRunning && !_isPaused;
+        public bool IsActive => _stopwatch.IsRunning || _isPaused;
 
         public TrainingTimerControl()
         {

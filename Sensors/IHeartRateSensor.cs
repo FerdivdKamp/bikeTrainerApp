@@ -9,7 +9,7 @@ namespace ErgTrainer.Sensors
     /// </summary>
     public interface IHeartRateSensor
     {
-        /// <summary>Human-readable name, e.g. "ANT+ HRM" or "BLE HRM".</summary>
+        /// <summary>Human-readable name, e.g. "BLE HRM".</summary>
         string Name { get; }
 
         /// <summary>

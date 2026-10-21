@@ -4,8 +4,8 @@
 
 ErgTrainer is a personal .NET 8 Windows Forms application for indoor cycling.
 It scans for and connects to BLE Tacx trainers and heart-rate monitors, reads
-telemetry, displays live charts and a training timer, and contains ANT+ support
-and CSV recording code. It is a desktop app, not a Windows Service.
+telemetry, displays live charts and a training timer, and contains CSV recording
+code. It is a desktop app, not a Windows Service.
 
 An important goal is learning. Act as a pair programmer: explain meaningful
 design choices, keep work small and reviewable, and do not make unrelated
@@ -17,7 +17,7 @@ improvements or refactors.
 - `MainForm.cs` owns the current UI composition and wires device and timer events.
 - `Controls/` contains reusable WinForms controls, including the timer and charts.
 - `Sensors/` contains Bluetooth scanning, BLE Tacx/heart-rate implementations,
-  ANT+ heart-rate support, and device data models.
+  and device data models.
 - `Recorders/` contains recording-related code.
 - `ergtrainer.csproj` defines the WinForms target and NuGet dependencies.
 
@@ -29,10 +29,8 @@ and Windows Forms.
 
 - Target: `net8.0-windows10.0.19041.0`.
 - Output: Windows executable using Windows Forms.
-- Platform target: x86. Preserve this unless a task explicitly requires changing
-  it, because the ANT+ libraries and USB driver integration may depend on it.
-- Main external integrations: `InTheHand.BluetoothLE` and Small Earth Tech ANT+
-  packages.
+- Platform target: x64. Preserve this unless a task explicitly requires changing it.
+- Main external integration: `InTheHand.BluetoothLE`.
 - Namespace: `ErgTrainer`.
 
 Follow the style already used in the affected files. Prefer straightforward,
@@ -48,18 +46,18 @@ dependencies already meet the need.
 - `async void` is appropriate only for WinForms event handlers and lifecycle
   overrides that require it. Keep their exception handling explicit so failures
   are visible to the user or debugger.
-- Use `async`/`await` for Bluetooth, ANT+, file, and other I/O. Avoid `.Result`,
+- Use `async`/`await` for Bluetooth, file, and other I/O. Avoid `.Result`,
   `.Wait()`, and unnecessary `Task.Run`.
 - Pass and honor `CancellationToken`s when an API and call path support them.
 - Preserve responsive UI: never block the UI thread during scanning, connection,
   device discovery, or file operations.
 - When forms or controls are disposed, unsubscribe event handlers and release
-  timers, Bluetooth connections, ANT+ resources, and writers. Form close must
+  timers, Bluetooth connections, and writers. Form close must
   leave device connections in a clean state.
 
 ## Device and telemetry behavior
 
-BLE and ANT+ devices are unreliable. Handle unavailable hardware, incomplete
+BLE devices are unreliable. Handle unavailable hardware, incomplete
 advertisements, failed connections, disconnects, malformed data, and cancellation
 as expected operational conditions. Give the user clear status feedback and use
 diagnostic logging where it helps investigate device issues.
@@ -94,8 +92,8 @@ After a code change, run the focused build when possible:
 dotnet build .\ergtrainer.sln
 ```
 
-Hardware-dependent behavior cannot be proven by a build. State clearly when BLE,
-ANT+, or physical trainer verification was not performed and give concise manual
+Hardware-dependent behavior cannot be proven by a build. State clearly when BLE
+or physical trainer verification was not performed and give concise manual
 steps when they are relevant. Add or update deterministic tests only where a test
 project exists or where introducing one is justified by the task.
 
