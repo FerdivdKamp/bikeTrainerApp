@@ -13,7 +13,7 @@ public class DataRecorder
     private bool _isRecording = false;
     private DateTime _recordingStartTime;
     private string _currentRecordingPath = "";
-    private StreamWriter _writer;
+    private StreamWriter? _writer;
     private readonly object _lockObject = new();
 
     public bool IsRecording => _isRecording;
@@ -96,7 +96,6 @@ public class TacxDevice
 {
     private DataRecorder _dataRecorder = new();
     private TacxDevice _device = new();
-    private bool _isConnected = false;
 
     public async Task StartRecordingAsync()
     {

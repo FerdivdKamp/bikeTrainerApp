@@ -61,7 +61,9 @@ namespace ErgTrainer.Sensors
         private GattCharacteristic? _fecWriteCharacteristic;
         private readonly SemaphoreSlim _controlGate = new(1, 1);
         private TaskCompletionSource<byte>? _pendingFecStatus;
+        private byte? _pendingFecPage;
         private CancellationTokenSource? _pollingCts;
+        private long _lastPrimaryNotificationTimestamp;
         private readonly List<GattCharacteristic> _otherCharacteristics = new();
         private readonly object _measurementLock = new();
         private TrainerData? _latestPrimaryData;
@@ -168,6 +170,7 @@ namespace ErgTrainer.Sensors
         /// </summary>
         public async Task<bool> ConnectToDeviceAsync(BluetoothDevice device, CancellationToken cancellationToken = default)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (device == null)
             {
                 Debug.WriteLine("[Tacx] ConnectToDeviceAsync: device is null");
@@ -201,8 +204,15 @@ namespace ErgTrainer.Sensors
             }
             catch (Exception ex)
             {
-                // If already connected or other error, log and try to continue
-                Debug.WriteLine($"[Tacx] GATT connection attempt: {ex.Message} - continuing anyway");
+                Debug.WriteLine($"[Tacx] GATT connection failed: {ex.Message}");
+                return false;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!gatt.IsConnected)
+            {
+                Debug.WriteLine("[Tacx] GATT did not reach connected state.");
+                return false;
             }
 
             // Try FTMS first, then Cycling Power Service
@@ -245,17 +255,19 @@ namespace ErgTrainer.Sensors
             }
 
             Debug.WriteLine("[Tacx] Starting notifications (if supported)...");
+            bool primaryNotificationsStarted = false;
+            Volatile.Write(ref _lastPrimaryNotificationTimestamp, Stopwatch.GetTimestamp());
+            _indoorBikeDataCharacteristic.CharacteristicValueChanged += IndoorBikeDataCharacteristic_ValueChanged;
             try
             {
                 await _indoorBikeDataCharacteristic.StartNotificationsAsync();
                 Debug.WriteLine("[Tacx] Notifications started.");
-                
-                // Subscribe to notification events
-                _indoorBikeDataCharacteristic.CharacteristicValueChanged += IndoorBikeDataCharacteristic_ValueChanged;
+                primaryNotificationsStarted = true;
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[Tacx] StartNotificationsAsync failed (ignored): {ex.Message}");
+                _indoorBikeDataCharacteristic.CharacteristicValueChanged -= IndoorBikeDataCharacteristic_ValueChanged;
+                Debug.WriteLine($"[Tacx] StartNotificationsAsync failed: {ex.Message}");
             }
 
             // Capture the standard speed/cadence characteristic separately when available.
@@ -299,10 +311,23 @@ namespace ErgTrainer.Sensors
             await DiscoverControlAsync(gatt);
 
             await DiscoverOtherCharacteristicsAsync(gatt, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!gatt.IsConnected)
+            {
+                Debug.WriteLine("[Tacx] GATT disconnected during service discovery.");
+                return false;
+            }
 
-            Debug.WriteLine("[Tacx] Starting polling loop (as backup)...");
-            _pollingCts = new CancellationTokenSource();
-            _ = Task.Run(() => PollLoopAsync(_pollingCts.Token), _pollingCts.Token);
+            // Read only when notifications are unavailable or stop arriving.
+            if ((_indoorBikeDataCharacteristic.Properties & GattCharacteristicProperties.Read) != 0)
+            {
+                Debug.WriteLine("[Tacx] Starting telemetry fallback monitor.");
+                var pollingCts = new CancellationTokenSource();
+                _pollingCts = pollingCts;
+                var characteristic = _indoorBikeDataCharacteristic;
+                _ = Task.Run(() => PollLoopAsync(characteristic, primaryNotificationsStarted, pollingCts.Token), pollingCts.Token)
+                    .ContinueWith(_ => pollingCts.Dispose(), TaskScheduler.Default);
+            }
 
             Debug.WriteLine("[Tacx] ConnectToDeviceAsync: success");
             return true;
@@ -447,7 +472,10 @@ namespace ErgTrainer.Sensors
             }
         }
 
-        public async Task<string> SetTargetPowerAsync(int watts, CancellationToken cancellationToken = default)
+        public async Task<string> SetTargetPowerAsync(int watts, CancellationToken cancellationToken = default) =>
+            (await SetTargetPowerWithResultAsync(watts, cancellationToken)).Message;
+
+        public async Task<(bool Accepted, string Message)> SetTargetPowerWithResultAsync(int watts, CancellationToken cancellationToken = default)
         {
             if (watts < 0 || watts > 1000)
             {
@@ -455,15 +483,14 @@ namespace ErgTrainer.Sensors
             }
             if (!await _controlGate.WaitAsync(0, cancellationToken))
             {
-                return "A trainer control operation is already in progress.";
+                return (false, "A trainer control operation is already in progress.");
             }
 
             try
             {
-                var write = _fecWriteCharacteristic;
-                if (_device == null || write == null || _fecNotifyCharacteristic == null)
+                if (_device == null || _fecWriteCharacteristic == null || _fecNotifyCharacteristic == null)
                 {
-                    return "Tacx FE-C over BLE control is unavailable on this connection.";
+                    return (false, "Tacx FE-C over BLE control is unavailable on this connection.");
                 }
 
                 // FE-C acknowledged data page 49: target power in quarter-watt units.
@@ -476,35 +503,102 @@ namespace ErgTrainer.Sensors
                     command[12] ^= command[i];
                 }
 
-                var response = new TaskCompletionSource<byte>(TaskCreationOptions.RunContinuationsAsynchronously);
-                _pendingFecStatus = response;
-                cancellationToken.ThrowIfCancellationRequested();
-                if ((write.Properties & GattCharacteristicProperties.WriteWithoutResponse) != 0)
-                {
-                    await write.WriteValueWithoutResponseAsync(command);
-                }
-                else
-                {
-                    await write.WriteValueWithResponseAsync(command);
-                }
-
-                byte status = await response.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken);
+                byte status = await SendFecCommandAsync(command, cancellationToken);
                 return status switch
                 {
-                    0 => $"Trainer accepted {watts} W ERG target.",
-                    1 => "Trainer reported that the ERG command failed. Another app may own control.",
-                    2 => "Trainer does not support the ERG command.",
-                    3 => "Trainer rejected the ERG command. Another app may own control.",
-                    4 => "Trainer is still processing the ERG command.",
-                    _ => $"Trainer returned unknown FE-C command status 0x{status:X2}."
+                    0 => (true, $"Trainer accepted {watts} W ERG target."),
+                    1 => (false, "Trainer reported that the ERG command failed. Another app may own control."),
+                    2 => (false, "Trainer does not support the ERG command."),
+                    3 => (false, "Trainer rejected the ERG command. Another app may own control."),
+                    4 => (false, "Trainer is still processing the ERG command."),
+                    _ => (false, $"Trainer returned unknown FE-C command status 0x{status:X2}.")
                 };
             }
             finally
             {
-                _pendingFecStatus = null;
                 _controlGate.Release();
             }
         }
+
+        public async Task<(bool Accepted, string Message)> TestSimulationSlopeAsync(
+            decimal gradientPercent, decimal riderKg, decimal bikeKg, Action<string>? progress = null,
+            CancellationToken cancellationToken = default)
+        {
+            byte[] user = FecSimulationPackets.UserConfiguration(riderKg, bikeKg, WheelCircumferenceMm);
+            byte[] wind = FecSimulationPackets.NeutralWind();
+            byte[] track = FecSimulationPackets.TrackResistance(gradientPercent);
+            if (!await _controlGate.WaitAsync(0, cancellationToken))
+                return (false, "A trainer control operation is already in progress.");
+            try
+            {
+                if (_device == null || _fecWriteCharacteristic == null || _fecNotifyCharacteristic == null)
+                    return (false, "Tacx FE-C over BLE control is unavailable on this connection.");
+
+                foreach (var (command, step) in new[]
+                {
+                    (user, "user configuration"), (wind, "neutral wind"), (track, "track gradient")
+                })
+                {
+                    progress?.Invoke($"Control: sending {step}...");
+                    byte status = await SendFecCommandAsync(command, cancellationToken);
+                    if (status != 0)
+                        return (false, $"Trainer {FecStatusText(status)} {step} (page 0x{command[4]:X2}).");
+                }
+                return (true, $"Trainer accepted {gradientPercent:0.#}% gradient. Pedal to verify resistance changed.");
+            }
+            finally
+            {
+                _controlGate.Release();
+            }
+        }
+
+        private async Task<byte> SendFecCommandAsync(byte[] command, CancellationToken cancellationToken)
+        {
+            var write = _fecWriteCharacteristic ?? throw new InvalidOperationException("FE-C control disconnected.");
+            var response = new TaskCompletionSource<byte>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingFecPage = command[4];
+            _pendingFecStatus = response;
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Debug.WriteLine($"[Tacx] FE-C command: {Convert.ToHexString(command)}");
+                await WriteFecValueAsync(write, command);
+                if (!response.Task.IsCompleted)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    byte[] request = FecSimulationPackets.RequestCommandStatus();
+                    Debug.WriteLine($"[Tacx] Requesting FE-C command status: {Convert.ToHexString(request)}");
+                    await WriteFecValueAsync(write, request);
+                }
+                try
+                {
+                    return await response.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken);
+                }
+                catch (TimeoutException)
+                {
+                    throw new TimeoutException($"No FE-C status for command page 0x{command[4]:X2} after requesting page 71.");
+                }
+            }
+            finally
+            {
+                _pendingFecStatus = null;
+                _pendingFecPage = null;
+            }
+        }
+
+        private static Task WriteFecValueAsync(GattCharacteristic write, byte[] value) =>
+            (write.Properties & GattCharacteristicProperties.WriteWithoutResponse) != 0
+                ? write.WriteValueWithoutResponseAsync(value)
+                : write.WriteValueWithResponseAsync(value);
+
+        private static string FecStatusText(byte status) => status switch
+        {
+            1 => "reported a failure for",
+            2 => "does not support",
+            3 => "rejected",
+            4 => "is still processing",
+            _ => $"returned status 0x{status:X2} for"
+        };
 
         private void FecNotifyCharacteristic_ValueChanged(object? sender, GattCharacteristicValueChangedEventArgs e)
         {
@@ -514,28 +608,13 @@ namespace ErgTrainer.Sensors
                 return;
             }
 
-            byte[]? data = e.Value;
-            if (data == null || data.Length != 13 || data[0] != 0xA4 || data[1] != 0x09 || data[3] != 0x05)
-            {
-                return;
-            }
-
-            byte checksum = 0;
-            foreach (byte value in data)
-            {
-                checksum ^= value;
-            }
-            if (checksum != 0)
-            {
-                Debug.WriteLine("[Tacx] Ignoring FE-C packet with invalid checksum.");
-                return;
-            }
-
             // Command Status page 71: last command, sequence, result, then four data bytes.
-            if (data[4] == 0x47 && data[5] == 0x31)
+            byte[]? data = e.Value;
+            if (data is { Length: > 4 } && data[4] == 0x47)
+                Debug.WriteLine($"[Tacx] FE-C page 71 received: {Convert.ToHexString(data)}; expected command 0x{_pendingFecPage:X2}");
+            if (_pendingFecPage is byte page && FecSimulationPackets.TryReadCommandStatus(data, page, out byte status))
             {
-                Debug.WriteLine($"[Tacx] FE-C ERG command status: {Convert.ToHexString(data)}");
-                _pendingFecStatus?.TrySetResult(data[7]);
+                _pendingFecStatus?.TrySetResult(status);
             }
         }
 
@@ -831,7 +910,15 @@ namespace ErgTrainer.Sensors
         {
             try
             {
+                if (e.Error != null)
+                {
+                    Debug.WriteLine($"[Tacx] Primary notification error: {e.Error}");
+                    return;
+                }
+
                 byte[]? data = e.Value;
+                if (data is { Length: > 0 })
+                    Volatile.Write(ref _lastPrimaryNotificationTimestamp, Stopwatch.GetTimestamp());
                 Debug.WriteLine($"[Tacx] Notification received: {data?.Length ?? 0} bytes");
                 if (data != null && data.Length > 0)
                 {
@@ -862,16 +949,29 @@ namespace ErgTrainer.Sensors
             }
         }
 
-        private async Task PollLoopAsync(CancellationToken token)
+        private async Task PollLoopAsync(GattCharacteristic characteristic, bool notificationsStarted, CancellationToken token)
         {
-            if (_indoorBikeDataCharacteristic == null)
-                return;
-
+            bool usingFallback = false;
             while (!token.IsCancellationRequested)
             {
                 try
                 {
-                    byte[]? data = await _indoorBikeDataCharacteristic.ReadValueAsync();
+                    if (notificationsStarted && Stopwatch.GetElapsedTime(
+                            Volatile.Read(ref _lastPrimaryNotificationTimestamp)) < TimeSpan.FromSeconds(5))
+                    {
+                        if (usingFallback)
+                            Debug.WriteLine("[Tacx] Primary notifications resumed; stopping fallback reads.");
+                        usingFallback = false;
+                        await Task.Delay(TimeSpan.FromSeconds(1), token);
+                        continue;
+                    }
+
+                    if (notificationsStarted && !usingFallback)
+                    {
+                        Debug.WriteLine("[Tacx] Primary notifications stalled; starting fallback reads.");
+                        usingFallback = true;
+                    }
+                    byte[]? data = await characteristic.ReadValueAsync();
                     Debug.WriteLine($"[Tacx] Poll read: {data?.Length ?? 0} bytes");
                     if (data != null && data.Length > 0)
                     {
@@ -1181,14 +1281,14 @@ namespace ErgTrainer.Sensors
                             break;
                         }
                         // Try low byte only
-                        else if (powerLow >= 5 && powerLow < 2000)
+                        else if (powerLow >= 5)
                         {
                             powerWatts = powerLow;
                             Debug.WriteLine($"[Tacx] Power found @{powOffset}: low byte {powerLow} (0x{powerLow:X2}) -> {powerWatts:F0} W");
                             break;
                         }
                         // Try high byte only
-                        else if (powerHigh >= 5 && powerHigh < 2000)
+                        else if (powerHigh >= 5)
                         {
                             powerWatts = powerHigh;
                             Debug.WriteLine($"[Tacx] Power found @{powOffset}: high byte {powerHigh} (0x{powerHigh:X2}) -> {powerWatts:F0} W");

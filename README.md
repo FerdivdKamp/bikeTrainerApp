@@ -6,12 +6,57 @@ capture the original BLE characteristic payloads for offline interpretation.
 
 ## Build and run
 
-The application targets Windows and x86.
+The application targets Windows and x64. Trainer and heart-rate connections use BLE.
 
     dotnet build .\ergtrainer.sln
     dotnet run --project .\ergtrainer.csproj
 
 You can also open ergtrainer.sln in Visual Studio and start it with F5.
+
+## Training sessions
+
+The **Trainer** tab keeps the existing live BLE interface and free-ride timer.
+The **Session Builder** tab lets you create ERG or Simulation workouts, add and
+reorder blocks, enter coaching instructions, preview progress, and save or load
+versioned `.ergsession.json` files. Sessions are local files you choose with the
+Save/Load dialogs. The builder accepts gradients from -20% to 20% for planning.
+
+To run an ERG session, connect a Tacx trainer that reports **Tacx FE-C over BLE**
+control, stop the free-ride timer, and select **Start session**. The app sends
+the first watt target before starting the session clock, then sends each new
+target at its block boundary. Pause freezes the clock and visual progress but
+leaves the current trainer target in effect. Stopping or finishing also leaves
+the last target in effect until you change it or disconnect the trainer.
+If the trainer connection drops during a session, the clock pauses and the app
+tries to reconnect up to three times. After reconnecting, it resends the current
+ERG target and waits for you to press **Resume**. If automatic attempts fail,
+use **Retry trainer** in the Trainer tab or **Stop** in the Session Builder.
+An intentional disconnect stops the session. Trainer commands and resistance
+should be checked on physical hardware before relying on a workout.
+
+Starting a session automatically creates a small event CSV under
+`Documents/ErgTrainer/SessionLogs`. It records timestamps for session starts,
+block commands, pauses, disconnects, and reconnect attempts. It does not record
+every telemetry sample or raw BLE packet. The **Record raw device signals**
+checkbox is optional and intended for protocol/telemetry investigation, not
+required to run or log a training session.
+
+Simulation sessions can be edited, saved, loaded, and previewed. Their **Start**
+button is disabled because the app does not yet have a verified BLE slope-control
+result on this trainer; it does not substitute watt targets for gradients. The Tacx
+[communication overview](https://developer.garmin.com/tacx-trainer/overview/)
+distinguishes FE-C over BLE from FTMS, and a
+[Tacx-compatible demonstration](https://github.com/jedla22/BleTrainerControl)
+describes track resistance. This app now has a manual slope test, but its effect
+has not been tested on the original NEO Smart.
+Simulation sessions also store editable rider and bike weight estimates in kg.
+Older session files without these fields load with 75 kg and 10 kg defaults;
+update them to your own estimates before eventual hardware use. See
+[`prompt_simulation_mode.md`](prompt_simulation_mode.md) for the implementation phases.
+
+The hardware-independent session checks run with:
+
+    dotnet run --project .\Tests\SessionChecks.csproj
 
 ## Trainer cadence and estimated speed
 
@@ -40,8 +85,27 @@ and [FE-C over BLE guide](https://github.com/jedla22/BleTrainerControl/blob/mast
 service `6e40fec1`, notifications `6e40fec2`, writes `6e40fec3`, target-power
 page 49 and command-status page 71. There is no separate request-control opcode
 in this legacy example; the target-power command requests a mode change and
-its status reports acceptance or rejection. Trainers exposing FTMS retain the
+the app requests page 71 to check acceptance or rejection. Trainers exposing FTMS retain the
 **Test FTMS control** action instead.
+
+## Manual slope test
+
+With a Tacx FE-C-over-BLE trainer connected, use **Slope %**, **Rider kg**, and
+**Bike kg** in the Trainer tab, then select **Set test slope**. The test sends
+FE-C user configuration, neutral wind, and track resistance in order. It uses
+the displayed Wheel mm circumference to estimate wheel diameter, a fixed 1.98:1
+gear ratio, zero wind drag, and a 0.004 rolling-resistance coefficient. These
+are test assumptions, not a calibrated riding model. The control status shows
+which step was rejected or whether the slope command was accepted. Disconnecting
+the trainer cancels an in-progress test.
+
+For a first physical check, pedal in the same gear at a steady cadence and set
+0%, then 3%, then 0% again. Compare how resistance feels and how power changes.
+Repeat with a different rider-weight estimate if the grade change works. The
+test control is limited to -5% through 5%. Set 0% to return to flat resistance,
+or disconnect when finished. An accepted command is not proof that physical
+resistance changed. The Session Builder will remain disabled for Simulation
+execution until that is verified on the trainer.
 
 ## Raw signal recording
 
@@ -98,13 +162,3 @@ The HRM can be tested without a Tacx trainer connection.
 When sharing a result for analysis, provide the CSV and note approximately when
 you started moving and what BPM you expected. This gives us a reference point
 for interpreting the packet flags and value bytes.
-
-## Legacy ANT+ support (to be deprecated)
-
-The current application flow uses Bluetooth for the trainer and HRM. The
-repository still contains older ANT+ sensor code and package references, which
-are not used for the Bluetooth test run and are expected to be removed later.
-ANT+ requires a compatible USB ANT+ stick.
-
-    dotnet add package SmallEarthTech.AntUsbStick
-    dotnet add package SmallEarthTech.AntPlus
