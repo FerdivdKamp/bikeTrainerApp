@@ -41,14 +41,34 @@ every telemetry sample or raw BLE packet. The **Record raw device signals**
 checkbox is optional and intended for protocol/telemetry investigation, not
 required to run or log a training session.
 
+An ERG session also records an activity under `Documents/ErgTrainer/Activities`,
+independent of the raw-signal checkbox. The `.jsonl` journal contains the UTC
+start and end, block changes, pause/disconnect events, and measured power,
+cadence, speed, and heart rate at up to one sample per second. Missing readings
+stay missing. When the session completes or you stop it, the app exports a
+matching `.fit` **Activity** file for Garmin Connect. The Trainer tab shows the
+file path and has an **Open activity folder** button. The FIT file stores elapsed
+time separately from active timer time; it contains no GPS track, estimated
+distance, calories, or invented readings. FIT timestamps have one-second
+resolution, so subsecond timing is retained in the journal. A session with no
+measured telemetry keeps its journal but cannot produce a valid FIT record.
+
+To import, open [Garmin Connect Web](https://connect.garmin.com/), choose
+**Upload or Import Data**, and select the `.fit` file. This is a manual import;
+the app does not sign in to Garmin or upload automatically. A failed FIT export
+leaves the journal in place. If the app exits unexpectedly, recent journal rows
+that reached the writer remain readable, but the journal may have no final end
+event and no importable FIT file. The app does not reconstruct missing telemetry
+from old event-only CSVs.
+
 Simulation sessions can be edited, saved, loaded, and previewed. Their **Start**
-button is disabled because the app does not yet have a verified BLE slope-control
-result on this trainer; it does not substitute watt targets for gradients. The Tacx
+button remains disabled until simulation blocks are wired to trainer control;
+it does not substitute watt targets for gradients. The Tacx
 [communication overview](https://developer.garmin.com/tacx-trainer/overview/)
 distinguishes FE-C over BLE from FTMS, and a
 [Tacx-compatible demonstration](https://github.com/jedla22/BleTrainerControl)
-describes track resistance. This app now has a manual slope test, but its effect
-has not been tested on the original NEO Smart.
+describes track resistance. A rider test reported distinct resistance at 2%,
+3%, and 5% in the manual slope test.
 Simulation sessions also store editable rider and bike weight estimates in kg.
 Older session files without these fields load with 75 kg and 10 kg defaults;
 update them to your own estimates before eventual hardware use. See
@@ -90,8 +110,9 @@ the app requests page 71 to check acceptance or rejection. Trainers exposing FTM
 
 ## Manual slope test
 
-With a Tacx FE-C-over-BLE trainer connected, use **Slope %**, **Rider kg**, and
-**Bike kg** in the Trainer tab, then select **Set test slope**. The test sends
+With a Tacx FE-C-over-BLE trainer connected, use **Slope %** (-20% to 20%),
+**Rider kg**, and **Bike kg** in the Trainer tab, then select **Set test slope**.
+The test sends
 FE-C user configuration, neutral wind, and track resistance in order. It uses
 the displayed Wheel mm circumference to estimate wheel diameter, a fixed 1.98:1
 gear ratio, zero wind drag, and a 0.004 rolling-resistance coefficient. These

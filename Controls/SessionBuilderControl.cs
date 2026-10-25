@@ -130,7 +130,7 @@ public sealed class SessionBuilderControl : UserControl
         _start.Enabled = !_active && snapshot.Mode == "erg";
         if (!_active)
             _status.Text = snapshot.Mode == "simulation"
-                ? "Simulation editing and preview are available. Hardware start is disabled: slope control has not been verified for this BLE connection."
+                ? "Simulation editing and preview are available. Hardware start is disabled until gradient blocks are wired to trainer control."
                 : "ERG session ready to validate and start after connecting a Tacx FE-C-over-BLE trainer.";
     }
 

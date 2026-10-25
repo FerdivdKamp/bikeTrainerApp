@@ -1,5 +1,7 @@
 # ErgTrainer next version: phased plan and agent prompts
 
+**Planning status:** This is an earlier Flutter-first backlog, not a selected implementation route. See [`android_build_options.md`](android_build_options.md) for the current Android requirements, alternatives, tradeoffs, and decision gates.
+
 Last reviewed: 2026-10-21. This is a backlog and set of prompts, not a claim that the work below is implemented. Each numbered phase is small enough to become a GitHub issue or a separate agent task. Recheck tool and package versions when starting a phase.
 
 ## Goal and recommended direction
