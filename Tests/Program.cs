@@ -1,6 +1,15 @@
 using System;
 using System.IO;
 using ErgTrainer.Sessions;
+using ErgTrainer.Recorders;
+using Decode = Dynastream.Fit.Decode;
+using RecordMesg = Dynastream.Fit.RecordMesg;
+using LapMesg = Dynastream.Fit.LapMesg;
+using SessionMesg = Dynastream.Fit.SessionMesg;
+using ActivityMesg = Dynastream.Fit.ActivityMesg;
+using EventMesg = Dynastream.Fit.EventMesg;
+using Event = Dynastream.Fit.Event;
+using MesgNum = Dynastream.Fit.MesgNum;
 using ErgTrainer.Sensors;
 
 static void Check(bool condition, string message)
@@ -92,3 +101,88 @@ finally
 }
 
 Console.WriteLine("Session model, timing, validation, and JSON checks passed.");
+
+string activityDirectory = Path.Combine(Path.GetTempPath(), $"ergtrainer-fit-check-{Guid.NewGuid():N}");
+Directory.CreateDirectory(activityDirectory);
+try
+{
+    var start = new DateTimeOffset(2026, 10, 25, 12, 0, 0, TimeSpan.Zero);
+    var recorder = new ActivityRecorder("Intervals", start, activityDirectory);
+    Check(recorder.Add(new ActivityEntry("sample", start.AddSeconds(1),
+        PowerWatts: 180, CadenceRpm: 85, SpeedKph: 27)), "First sample was rejected.");
+    recorder.Add(new ActivityEntry("pause", start.AddSeconds(5), ActiveSeconds: 5));
+    recorder.Add(new ActivityEntry("resume", start.AddSeconds(15), ActiveSeconds: 5));
+    recorder.Add(new ActivityEntry("sample", start.AddSeconds(16),
+        PowerWatts: 190, HeartRateBpm: 145));
+    recorder.Add(new ActivityEntry("block", start.AddSeconds(20), "Hard", 1,
+        ActiveSeconds: 10));
+    recorder.Add(new ActivityEntry("disconnect", start.AddSeconds(21), ActiveSeconds: 11));
+    recorder.Add(new ActivityEntry("resume", start.AddSeconds(24), ActiveSeconds: 11));
+    string fitPath = await recorder.FinishAsync(start.AddSeconds(30), 17, "complete");
+    Check(File.Exists(recorder.JournalPath), "Activity journal was lost after export.");
+    using var stream = File.OpenRead(fitPath);
+    var decode = new Decode();
+    Check(decode.CheckIntegrity(stream), "FIT SDK integrity check failed.");
+    int records = 0, laps = 0, sessions = 0, activities = 0, timerEvents = 0;
+    decode.MesgEvent += (_, e) =>
+    {
+        if (e.mesg.Num == MesgNum.Record)
+        {
+            var record = new RecordMesg(e.mesg);
+            if (records == 0)
+            {
+                Check(record.GetHeartRate() == null,
+                    "Missing first heart-rate reading became a value.");
+                Check(record.GetPower() == 180 && record.GetCadence() == 85 &&
+                    Math.Abs((record.GetSpeed() ?? 0) - 7.5f) < 0.01,
+                    "Measured trainer values or speed units changed in FIT.");
+                Check(record.GetPositionLat() == null, "FIT contains a fabricated GPS point.");
+            }
+            records++;
+        }
+        if (e.mesg.Num == MesgNum.Lap) laps++;
+        if (e.mesg.Num == MesgNum.Session)
+        {
+            var session = new SessionMesg(e.mesg);
+            sessions++;
+            Check(Math.Abs((session.GetTotalElapsedTime() ?? 0) - 30) < 0.01,
+                "FIT elapsed time is wrong.");
+            Check(Math.Abs((session.GetTotalTimerTime() ?? 0) - 17) < 0.01,
+                "FIT active time is wrong.");
+        }
+        if (e.mesg.Num == MesgNum.Activity) activities++;
+        if (e.mesg.Num == MesgNum.Event && new EventMesg(e.mesg).GetEvent() == Event.Timer)
+            timerEvents++;
+    };
+    Check(decode.Read(stream), "FIT SDK could not decode activity.");
+    Check(records == 2 && laps == 2 && sessions == 1 && activities == 1 && timerEvents == 6,
+        $"FIT activity message counts are wrong: {records} records, {laps} laps, " +
+        $"{sessions} sessions, {activities} activities, {timerEvents} timer events.");
+
+    var existingFit = File.ReadAllBytes(fitPath);
+    try
+    {
+        FitActivityExporter.Export(recorder.JournalPath, fitPath);
+        throw new Exception("An existing FIT export was overwritten.");
+    }
+    catch (IOException) { }
+    Check(File.ReadAllBytes(fitPath).AsSpan().SequenceEqual(existingFit),
+        "An existing FIT export was changed.");
+
+    var empty = new ActivityRecorder("No telemetry", start, activityDirectory);
+    try
+    {
+        await empty.FinishAsync(start.AddSeconds(2), 2, "stopped");
+        throw new Exception("FIT export invented a record for a session without telemetry.");
+    }
+    catch (InvalidDataException) { }
+    Check(File.Exists(empty.JournalPath) && !File.Exists(empty.FitPath),
+        "A telemetry-free session lost its journal or produced a FIT file.");
+}
+finally
+{
+    foreach (string file in Directory.GetFiles(activityDirectory)) File.Delete(file);
+    Directory.Delete(activityDirectory);
+}
+
+Console.WriteLine("FIT activity encoding, pause timing, and SDK integrity checks passed.");

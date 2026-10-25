@@ -534,9 +534,16 @@ namespace ErgTrainer.Sensors
                 if (_device == null || _fecWriteCharacteristic == null || _fecNotifyCharacteristic == null)
                     return (false, "Tacx FE-C over BLE control is unavailable on this connection.");
 
+                progress?.Invoke("Control: sending user configuration...");
+                // FE-C page 55 is configuration, not one of the control pages
+                // reported as the last command by status page 71.
+                cancellationToken.ThrowIfCancellationRequested();
+                await WriteFecValueAsync(_fecWriteCharacteristic, user, preferResponse: true);
+                cancellationToken.ThrowIfCancellationRequested();
+
                 foreach (var (command, step) in new[]
                 {
-                    (user, "user configuration"), (wind, "neutral wind"), (track, "track gradient")
+                    (wind, "neutral wind"), (track, "track gradient")
                 })
                 {
                     progress?.Invoke($"Control: sending {step}...");
@@ -544,7 +551,7 @@ namespace ErgTrainer.Sensors
                     if (status != 0)
                         return (false, $"Trainer {FecStatusText(status)} {step} (page 0x{command[4]:X2}).");
                 }
-                return (true, $"Trainer accepted {gradientPercent:0.#}% gradient. Pedal to verify resistance changed.");
+                return (true, $"Trainer accepted {gradientPercent:0.#}% gradient. User configuration was sent without FE-C status. Pedal to verify resistance changed.");
             }
             finally
             {
@@ -586,10 +593,18 @@ namespace ErgTrainer.Sensors
             }
         }
 
-        private static Task WriteFecValueAsync(GattCharacteristic write, byte[] value) =>
-            (write.Properties & GattCharacteristicProperties.WriteWithoutResponse) != 0
-                ? write.WriteValueWithoutResponseAsync(value)
-                : write.WriteValueWithResponseAsync(value);
+        private static Task WriteFecValueAsync(GattCharacteristic write, byte[] value, bool preferResponse = false)
+        {
+            bool canWriteWithResponse = (write.Properties & GattCharacteristicProperties.Write) != 0;
+            bool canWriteWithoutResponse = (write.Properties & GattCharacteristicProperties.WriteWithoutResponse) != 0;
+            if (preferResponse && canWriteWithResponse)
+                return write.WriteValueWithResponseAsync(value);
+            if (canWriteWithoutResponse)
+                return write.WriteValueWithoutResponseAsync(value);
+            if (canWriteWithResponse)
+                return write.WriteValueWithResponseAsync(value);
+            throw new InvalidOperationException("FE-C characteristic does not support writes.");
+        }
 
         private static string FecStatusText(byte status) => status switch
         {
