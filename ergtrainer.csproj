@@ -10,5 +10,6 @@
     <Compile Remove="Tests\**\*.cs" />
     <Compile Remove="Android\**\*.cs" />
     <PackageReference Include="InTheHand.BluetoothLE" Version="4.0.43" />
+    <PackageReference Include="Garmin.FIT.Sdk" Version="21.218.0" />
   </ItemGroup>
 </Project>

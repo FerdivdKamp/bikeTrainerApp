@@ -535,9 +535,16 @@ namespace ErgTrainer.Sensors
                 if (_device == null || _fecWriteCharacteristic == null || _fecNotifyCharacteristic == null)
                     return (false, "Tacx FE-C over BLE control is unavailable on this connection.");
 
+                progress?.Invoke("Control: sending user configuration...");
+                // FE-C page 55 is configuration, not one of the control pages
+                // reported as the last command by status page 71.
+                cancellationToken.ThrowIfCancellationRequested();
+                await WriteFecValueAsync(_fecWriteCharacteristic, user, cancellationToken, preferResponse: true);
+                cancellationToken.ThrowIfCancellationRequested();
+
                 foreach (var (command, step) in new[]
                 {
-                    (user, "user configuration"), (wind, "neutral wind"), (track, "track gradient")
+                    (wind, "neutral wind"), (track, "track gradient")
                 })
                 {
                     progress?.Invoke($"Control: sending {step}...");
@@ -545,7 +552,7 @@ namespace ErgTrainer.Sensors
                     if (status != 0)
                         return (false, $"Trainer {FecStatusText(status)} {step} (page 0x{command[4]:X2}).");
                 }
-                return (true, $"Trainer accepted {gradientPercent:0.#}% gradient. Pedal to verify resistance changed.");
+                return (true, $"Trainer accepted {gradientPercent:0.#}% gradient. User configuration was sent without FE-C status. Pedal to verify resistance changed.");
             }
             finally
             {
@@ -595,7 +602,7 @@ namespace ErgTrainer.Sensors
             }
         }
 
-        private static async Task WriteFecValueAsync(GattCharacteristic write, byte[] value, CancellationToken token)
+        private static async Task WriteFecValueAsync(GattCharacteristic write, byte[] value, CancellationToken token, bool preferResponse = false)
         {
             // Android can report a write as busy after a preceding write-without-response.
             // Retry only that explicit rejection, which means the write was not queued.
@@ -604,10 +611,16 @@ namespace ErgTrainer.Sensors
                 token.ThrowIfCancellationRequested();
                 try
                 {
-                    if ((write.Properties & GattCharacteristicProperties.WriteWithoutResponse) != 0)
-                        await write.WriteValueWithoutResponseAsync(value);
-                    else
+                    bool canWriteWithResponse = (write.Properties & GattCharacteristicProperties.Write) != 0;
+                    bool canWriteWithoutResponse = (write.Properties & GattCharacteristicProperties.WriteWithoutResponse) != 0;
+                    if (preferResponse && canWriteWithResponse)
                         await write.WriteValueWithResponseAsync(value);
+                    else if (canWriteWithoutResponse)
+                        await write.WriteValueWithoutResponseAsync(value);
+                    else if (canWriteWithResponse)
+                        await write.WriteValueWithResponseAsync(value);
+                    else
+                        throw new InvalidOperationException("FE-C characteristic does not support writes.");
                     return;
                 }
                 catch (GattWriteRequestBusyException) when (attempt < 10)

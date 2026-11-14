@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -20,6 +21,18 @@ namespace ErgTrainer
         private readonly BleHeartRateSensor _hrmSensor;
         private readonly SignalRecorder _signalRecorder;
         private readonly SessionEventLog _sessionEventLog = new();
+        private ActivityRecorder? _activityRecorder;
+        private Task? _activityFinalization;
+        private readonly TextBox _activityStatus;
+        private readonly Button _btnOpenActivityFolder;
+        private string? _lastActivityPath;
+        private TrainerData? _latestActivityTrainer;
+        private DateTimeOffset _latestActivityTrainerAt;
+        private int? _latestActivityHeartRate;
+        private DateTimeOffset _latestActivityHeartRateAt;
+        private long _lastActivitySampleSecond = -1;
+        private int _lastActivityBlockIndex;
+        private bool _activityErrorShown;
 
         // Shared Device List
         private readonly GroupBox _grpDevices;
@@ -236,7 +249,7 @@ namespace ErgTrainer
             _testGradientLabel = new Label { Text = "Slope %:", Left = 10, Top = 169, AutoSize = true, Visible = false };
             _testGradient = new NumericUpDown
             {
-                Left = 85, Top = 165, Width = 70, Minimum = -5, Maximum = 5,
+                Left = 85, Top = 165, Width = 70, Minimum = -20, Maximum = 20,
                 DecimalPlaces = 1, Increment = .5m, Visible = false
             };
             _btnTestSlope = new Button
@@ -421,9 +434,23 @@ namespace ErgTrainer
 
             _grpTimer.Controls.Add(_trainingTimer);
 
+            _activityStatus = new TextBox
+            {
+                Left = 340, Top = 750, Width = 330, Height = 80,
+                Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
+                Text = "Activity: no session recorded yet."
+            };
+            _btnOpenActivityFolder = new Button
+            {
+                Left = 340, Top = 840, Width = 150, Text = "Open activity folder",
+                Enabled = false
+            };
+            _btnOpenActivityFolder.Click += (_, _) => OpenActivityFolder();
+
             var tabs = new TabControl { Dock = DockStyle.Fill };
             var trainerTab = new TabPage("Trainer") { AutoScroll = true };
-            trainerTab.Controls.AddRange(new Control[] { _grpDevices, _grpTacx, _grpHrm, _grpCharts, _grpTimer });
+            trainerTab.Controls.AddRange(new Control[] { _grpDevices, _grpTacx, _grpHrm, _grpCharts, _grpTimer,
+                _activityStatus, _btnOpenActivityFolder });
             var builderTab = new TabPage("Session Builder");
             _sessionBuilder = new SessionBuilderControl();
             builderTab.Controls.Add(_sessionBuilder);
@@ -820,6 +847,11 @@ namespace ErgTrainer
             string cadence = data.CadenceRpm?.ToString("F0") ?? "--";
             string speed = data.SpeedKph?.ToString("F1") ?? "--";
             _lblTacxData.Text = $"Power: {data.PowerWatts:F0} W | Cadence: {cadence} rpm | Speed: {speed} kph";
+            if (_sessionClock.IsRunning && _activityRecorder != null)
+            {
+                _latestActivityTrainer = data;
+                _latestActivityTrainerAt = DateTimeOffset.UtcNow;
+            }
             
             // Only update charts if timer is running and not paused
             if (_trainingTimer.IsRunning || _sessionClock.IsRunning)
@@ -860,6 +892,8 @@ namespace ErgTrainer
             if (activeSession)
             {
                 _sessionClock.Pause();
+                RecordActivityEvent("disconnect");
+                _latestActivityTrainer = null;
                 ++_sessionGeneration;
                 _sessionCancellation?.Cancel();
                 _sessionCancellation?.Dispose();
@@ -1026,6 +1060,7 @@ namespace ErgTrainer
             _lblHrmStatus.Text = "Status: HRM disconnected";
             _btnDisconnectHrm.Enabled = false;
             _lblHeartRate.Text = "HR: -- bpm";
+            _latestActivityHeartRate = null;
             
             // Stop heart rate chart recording
             _chartHeartRate.StopRecording();
@@ -1040,6 +1075,11 @@ namespace ErgTrainer
             }
 
             _lblHeartRate.Text = $"HR: {bpm} bpm";
+            if (_sessionClock.IsRunning && _activityRecorder != null)
+            {
+                _latestActivityHeartRate = bpm;
+                _latestActivityHeartRateAt = DateTimeOffset.UtcNow;
+            }
             
             // Update heart rate chart (only if timer is running and not paused)
             if (_trainingTimer.IsRunning || _sessionClock.IsRunning)
@@ -1082,6 +1122,11 @@ namespace ErgTrainer
         private async void StartSessionAsync(TrainingSession session)
         {
             if (_sessionClock.IsActive || _sessionCommandPending || _manualControlPending) return;
+            if (_activityFinalization is { IsCompleted: false })
+            {
+                _sessionBuilder.SetRunState(false, false, "Wait for the previous FIT activity to finish exporting.");
+                return;
+            }
             if (_trainingTimer.IsActive)
             {
                 _sessionBuilder.SetRunState(false, false, "Stop the free-ride timer before starting a session.");
@@ -1094,7 +1139,7 @@ namespace ErgTrainer
             }
             if (session.Mode != "erg")
             {
-                _sessionBuilder.SetRunState(false, false, "Simulation hardware execution is unavailable: slope control is unverified.");
+                _sessionBuilder.SetRunState(false, false, "Simulation hardware execution is unavailable: gradient blocks are not yet wired to trainer control.");
                 return;
             }
 
@@ -1124,7 +1169,9 @@ namespace ErgTrainer
                 _runningSession = session;
                 _sessionEventLog.Write("session_started", $"Block 1; {session.Blocks[0].TargetWatts} W.");
                 _lastCommandedBlock = 0;
+                var startedUtc = DateTimeOffset.UtcNow;
                 _sessionClock.Start(session);
+                StartActivityRecording(session, startedUtc);
                 _trainingTimer.Enabled = false;
                 _chartPower.StartRecording();
                 _chartCadence.StartRecording();
@@ -1168,11 +1215,17 @@ namespace ErgTrainer
             if (position.Finished)
             {
                 _sessionEventLog.Write("session_complete");
-                StopSession();
+                StopSession("complete");
                 _sessionBuilder.SetRunState(false, false, "Session complete. Trainer retains its last target until changed or disconnected.");
                 return;
             }
+            if (_sessionClock.IsRunning) RecordActivitySample();
             _sessionBuilder.ShowPosition(session, position, _sessionClock.IsRunning);
+            if (position.BlockIndex != _lastActivityBlockIndex)
+            {
+                RecordActivityEvent("block", session.Blocks[position.BlockIndex].Name, position.BlockIndex);
+                _lastActivityBlockIndex = position.BlockIndex;
+            }
             if (!_sessionCommandPending && position.BlockIndex != _lastCommandedBlock)
                 _ = CommandBlockAsync(session, position.BlockIndex, _sessionGeneration);
         }
@@ -1217,6 +1270,7 @@ namespace ErgTrainer
         {
             if (!_sessionClock.IsRunning || _sessionRecovering) return;
             _sessionClock.Pause();
+            RecordActivityEvent("pause");
             _sessionEventLog.Write("session_paused");
             _sessionBuilder.SetRunState(true, false, "Session paused. Trainer retains its current target.");
             if (_runningSession != null) _sessionBuilder.ShowPosition(_runningSession, _sessionClock.Position, false);
@@ -1227,12 +1281,123 @@ namespace ErgTrainer
             if (!_sessionClock.IsActive || _sessionClock.IsRunning || _sessionRecovering ||
                 _connectedTrainerDevice == null) return;
             _sessionClock.Resume();
+            _latestActivityTrainer = null;
+            _latestActivityHeartRate = null;
+            RecordActivityEvent("resume");
             _sessionEventLog.Write("session_resumed");
             _sessionBuilder.SetRunState(true, true, "Session resumed.");
         }
 
-        private void StopSession()
+        private void StartActivityRecording(TrainingSession session, DateTimeOffset startedUtc)
         {
+            _latestActivityTrainer = null;
+            _latestActivityHeartRate = null;
+            _lastActivitySampleSecond = -1;
+            _lastActivityBlockIndex = 0;
+            _activityErrorShown = false;
+            try
+            {
+                _activityRecorder = new ActivityRecorder(session.Name, startedUtc);
+                _lastActivityPath = _activityRecorder.JournalPath;
+                _activityStatus.Text = $"Recording activity: {_lastActivityPath}";
+                _btnOpenActivityFolder.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ActivityRecorder] Unable to start: {ex}");
+                _lastActivityPath = null;
+                _btnOpenActivityFolder.Enabled = false;
+                _activityStatus.Text = $"Activity recording failed: {ex.Message}";
+            }
+        }
+
+        private void RecordActivityEvent(string kind, string? name = null, int? blockIndex = null)
+        {
+            if (_activityRecorder == null) return;
+            bool ok = _activityRecorder.Add(new ActivityEntry(kind, DateTimeOffset.UtcNow,
+                name, blockIndex, ActiveSeconds: _sessionClock.Elapsed.TotalSeconds));
+            if (!ok) ShowActivityError();
+        }
+
+        private void RecordActivitySample()
+        {
+            if (_activityRecorder == null) return;
+            var now = DateTimeOffset.UtcNow;
+            long second = now.ToUnixTimeSeconds();
+            if (second == _lastActivitySampleSecond) return;
+            _lastActivitySampleSecond = second;
+            TrainerData? trainer = now - _latestActivityTrainerAt <= TimeSpan.FromSeconds(3)
+                ? _latestActivityTrainer : null;
+            int? heartRate = now - _latestActivityHeartRateAt <= TimeSpan.FromSeconds(3)
+                ? _latestActivityHeartRate : null;
+            if (trainer == null && heartRate == null) return;
+            double? power = trainer != null && double.IsFinite(trainer.PowerWatts) && trainer.PowerWatts >= 0
+                ? trainer.PowerWatts : null;
+            double? cadence = trainer?.CadenceRpm is double rpm && double.IsFinite(rpm) && rpm >= 0
+                ? rpm : null;
+            double? speed = trainer?.SpeedKph is double kph && double.IsFinite(kph) && kph >= 0
+                ? kph : null;
+            if (power == null && cadence == null && speed == null && heartRate == null) return;
+            bool ok = _activityRecorder.Add(new ActivityEntry("sample", now,
+                PowerWatts: power, CadenceRpm: cadence, SpeedKph: speed,
+                HeartRateBpm: heartRate));
+            if (!ok) ShowActivityError();
+        }
+
+        private void ShowActivityError()
+        {
+            if (_activityErrorShown) return;
+            _activityErrorShown = true;
+            _activityStatus.Text = $"Activity recording failed: {_activityRecorder?.Error}. " +
+                $"Journal: {_lastActivityPath}";
+        }
+
+        private async Task FinishActivityAsync(ActivityRecorder recorder, string reason, double activeSeconds)
+        {
+            try
+            {
+                _activityStatus.Text = $"Finishing FIT activity: {recorder.JournalPath}";
+                string fitPath = await recorder.FinishAsync(DateTimeOffset.UtcNow, activeSeconds, reason);
+                _lastActivityPath = fitPath;
+                if (!_closingForCleanup && _activityRecorder == null)
+                    _activityStatus.Text = $"FIT activity ready: {fitPath}";
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ActivityRecorder] FIT export failed: {ex}");
+                _lastActivityPath = recorder.JournalPath;
+                if (!_closingForCleanup && _activityRecorder == null)
+                    _activityStatus.Text = $"FIT export failed: {ex.Message}. Journal: {recorder.JournalPath}";
+            }
+        }
+
+        private void OpenActivityFolder()
+        {
+            if (_lastActivityPath == null) return;
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = Path.GetDirectoryName(_lastActivityPath)!, UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Unable to open activity folder: {ex.Message}", "Activity folder",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void StopSession()
+            => StopSession("stopped");
+
+        private void StopSession(string reason)
+        {
+            if (_activityRecorder is { } recorder)
+            {
+                _activityRecorder = null;
+                _activityFinalization = FinishActivityAsync(recorder, reason, _sessionClock.Elapsed.TotalSeconds);
+            }
             _sessionEventLog.Write("session_stopped");
             _sessionEventLog.Stop();
             _reconnectCancellation?.Cancel();
@@ -1272,7 +1437,8 @@ namespace ErgTrainer
             Enabled = false;
             _reconnectCancellation?.Cancel();
             _manualControlCancellation?.Cancel();
-            if (_sessionClock.IsActive || _sessionCommandPending) StopSession();
+            if (_sessionClock.IsActive || _sessionCommandPending) StopSession("closed");
+            if (_activityFinalization != null) await _activityFinalization;
             if (_connectedTrainerDevice != null)
                 _connectedTrainerDevice.GattServerDisconnected -= TrainerDevice_GattServerDisconnected;
             _connectedTrainerDevice = null;
