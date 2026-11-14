@@ -8,6 +8,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Remove="Tests\**\*.cs" />
+    <Compile Remove="Android\**\*.cs" />
     <PackageReference Include="InTheHand.BluetoothLE" Version="4.0.43" />
   </ItemGroup>
 </Project>
