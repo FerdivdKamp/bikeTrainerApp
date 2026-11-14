@@ -13,7 +13,7 @@ public partial class MainActivity
     private LinearLayout? connectPage, testPage, createPage, sessionPage;
     private EditText workoutName = null!, blockName = null!, blockSeconds = null!, blockWatts = null!, blockInstruction = null!;
     private LinearLayout blockList = null!;
-    private TextView workoutStatus = null!, sessionStatus = null!, sessionDisplay = null!;
+    private TextView workoutStatus = null!, workoutSummary = null!, selectedBlockLabel = null!, sessionStatus = null!, sessionDisplay = null!;
     private Button pauseButton = null!, startButton = null!, stopButton = null!;
     private TrainingSession workout = new();
     private int selectedBlock = -1;
@@ -31,6 +31,17 @@ public partial class MainActivity
         input.SetSingleLine(true);
         if (numeric) input.InputType = InputTypes.ClassNumber;
         return input;
+    }
+
+    private LinearLayout ButtonRow(params Button[] buttons)
+    {
+        var row = new LinearLayout(this) { Orientation = global::Android.Widget.Orientation.Horizontal };
+        foreach (var button in buttons)
+        {
+            button.SetAllCaps(false);
+            row.AddView(button, new LinearLayout.LayoutParams(0, -2, 1));
+        }
+        return row;
     }
 
     private void ShowPage(string page)
@@ -99,7 +110,7 @@ public partial class MainActivity
     {
         var page = Page();
         page.AddView(Label("Create an ERG workout", 24));
-        page.AddView(Label("Tap a block to edit; hold and drag to reorder. Duration accepts seconds or 60*5."));
+        page.AddView(Label("Build a workout", 18));
         workoutName = Input("Workout name", workout.Name);
         blockName = Input("Block name", "Block");
         blockSeconds = Input("Duration in seconds (e.g. 60*5)", "60");
@@ -107,21 +118,35 @@ public partial class MainActivity
         blockInstruction = Input("Instruction (optional)");
         blockList = Page();
         workoutStatus = Label("");
+        workoutSummary = Label("");
+        selectedBlockLabel = Label("New block", 18);
+        page.AddView(Label("Workout name"));
         page.AddView(workoutName);
+        page.AddView(ButtonRow(
+            MakeButton("New", NewWorkout),
+            MakeButton("Open", async () => await OpenWorkoutAsync()),
+            MakeButton("Save", async () => await SaveWorkoutAsync())));
+        page.AddView(workoutStatus);
+        page.AddView(workoutSummary);
+        page.AddView(Label("Tap a block to edit it. Hold and drag to reorder."));
         page.AddView(blockList);
-        page.AddView(MakeButton("Select block", SelectBlock));
+        page.AddView(selectedBlockLabel);
+        page.AddView(Label("Block name"));
         page.AddView(blockName);
+        page.AddView(Label("Duration in seconds (for example, 60*5)"));
         page.AddView(blockSeconds);
+        page.AddView(Label("Target power (watts)"));
         page.AddView(blockWatts);
+        page.AddView(Label("Instruction (optional)"));
         page.AddView(blockInstruction);
-        page.AddView(MakeButton("Add block", () => ChangeBlock(false)));
-        page.AddView(MakeButton("Update selected block", () => ChangeBlock(true)));
-        page.AddView(MakeButton("Duplicate selected block", DuplicateBlock));
-        page.AddView(MakeButton("Move selected block up", () => MoveBlock(-1)));
-        page.AddView(MakeButton("Move selected block down", () => MoveBlock(1)));
-        page.AddView(MakeButton("Remove selected block", RemoveBlock));
-        page.AddView(MakeButton("New workout", NewWorkout));
-        page.AddView(MakeButton("Save workout", async () => await SaveWorkoutAsync()));
+        page.AddView(ButtonRow(
+            MakeButton("Add", () => ChangeBlock(false)),
+            MakeButton("Update", () => ChangeBlock(true)),
+            MakeButton("Duplicate", DuplicateBlock)));
+        page.AddView(ButtonRow(
+            MakeButton("Move up", () => MoveBlock(-1)),
+            MakeButton("Move down", () => MoveBlock(1)),
+            MakeButton("Remove", RemoveBlock)));
         page.AddView(MakeButton("Export workout to Drive or files", async () =>
         {
             string? previous = selectedWorkoutPath;
@@ -129,8 +154,7 @@ public partial class MainActivity
             if (selectedWorkoutPath != null && selectedWorkoutPath != previous)
                 ExportFile(selectedWorkoutPath, "application/json", "workout.ergsession.json");
         }));
-        page.AddView(MakeButton("Open saved workout", async () => await OpenWorkoutAsync()));
-        page.AddView(workoutStatus);
+        RefreshBlocks();
         return page;
     }
 
@@ -158,6 +182,11 @@ public partial class MainActivity
     {
         if (blockList == null) return;
         blockList.RemoveAllViews();
+        long total = workout.TotalSeconds;
+        workoutSummary.Text = $"{workout.Blocks.Count} blocks · {total / 3600:00}:{total / 60 % 60:00}:{total % 60:00} total";
+        selectedBlockLabel.Text = selectedBlock >= 0 && selectedBlock < workout.Blocks.Count
+            ? $"Editing block {selectedBlock + 1}: {workout.Blocks[selectedBlock].Name}"
+            : "New block";
         if (workout.Blocks.Count == 0) { blockList.AddView(Label("No blocks yet.")); return; }
         for (int i = 0; i < workout.Blocks.Count; i++)
         {
@@ -193,20 +222,6 @@ public partial class MainActivity
             };
             blockList.AddView(row);
         }
-    }
-
-    private void SelectBlock()
-    {
-        if (workout.Blocks.Count == 0) { workoutStatus.Text = "Add a block first."; return; }
-        var names = workout.Blocks.Select((b, i) => $"{i + 1}. {b.Name}").ToArray();
-        var dialog = new AlertDialog.Builder(this);
-        dialog.SetTitle("Select a block");
-        dialog.SetItems(names, (_, e) =>
-        {
-            LoadBlock(e.Which);
-        });
-        dialog.SetNegativeButton("Cancel", (_, _) => { });
-        dialog.Show();
     }
 
     private void LoadBlock(int index)
