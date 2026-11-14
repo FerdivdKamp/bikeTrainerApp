@@ -45,6 +45,7 @@ namespace ErgTrainer.Sensors
 
         public event EventHandler<TrainerData>? DataUpdated;
         public event EventHandler<RawDeviceData>? RawDataReceived;
+        public event Action<string>? ControlDiagnostic;
         public bool HasCyclingSpeedCadenceNotifications => _cscMeasurementCharacteristic != null;
         public string ControlMethod { get; private set; } = "unavailable";
         public int WheelCircumferenceMm { get; set; } = 2105;
@@ -538,7 +539,7 @@ namespace ErgTrainer.Sensors
                 // FE-C page 55 is configuration, not one of the control pages
                 // reported as the last command by status page 71.
                 cancellationToken.ThrowIfCancellationRequested();
-                await WriteFecValueAsync(_fecWriteCharacteristic, user, preferResponse: true);
+                await WriteFecValueAsync(_fecWriteCharacteristic, user, cancellationToken, preferResponse: true);
                 cancellationToken.ThrowIfCancellationRequested();
 
                 foreach (var (command, step) in new[]
@@ -568,14 +569,20 @@ namespace ErgTrainer.Sensors
             try
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                Debug.WriteLine($"[Tacx] FE-C command: {Convert.ToHexString(command)}");
-                await WriteFecValueAsync(write, command);
+                LogControl($"FE-C command page 0x{command[4]:X2}: {Convert.ToHexString(command)}");
+                await WriteFecValueAsync(write, command, cancellationToken);
+                Exception? statusRequestError = null;
                 if (!response.Task.IsCompleted)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     byte[] request = FecSimulationPackets.RequestCommandStatus();
-                    Debug.WriteLine($"[Tacx] Requesting FE-C command status: {Convert.ToHexString(request)}");
-                    await WriteFecValueAsync(write, request);
+                    LogControl($"Requesting FE-C command status: {Convert.ToHexString(request)}");
+                    try { await WriteFecValueAsync(write, request, cancellationToken); }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        statusRequestError = ex;
+                        LogControl($"Status request write failed after command write: {ex}");
+                    }
                 }
                 try
                 {
@@ -583,7 +590,9 @@ namespace ErgTrainer.Sensors
                 }
                 catch (TimeoutException)
                 {
-                    throw new TimeoutException($"No FE-C status for command page 0x{command[4]:X2} after requesting page 71.");
+                    string detail = statusRequestError == null ? "No status response arrived." :
+                        $"The status request failed: {statusRequestError.Message}";
+                    throw new TimeoutException($"The command was sent, but its result was not confirmed. {detail}");
                 }
             }
             finally
@@ -593,17 +602,32 @@ namespace ErgTrainer.Sensors
             }
         }
 
-        private static Task WriteFecValueAsync(GattCharacteristic write, byte[] value, bool preferResponse = false)
+        private static async Task WriteFecValueAsync(GattCharacteristic write, byte[] value, CancellationToken token, bool preferResponse = false)
         {
-            bool canWriteWithResponse = (write.Properties & GattCharacteristicProperties.Write) != 0;
-            bool canWriteWithoutResponse = (write.Properties & GattCharacteristicProperties.WriteWithoutResponse) != 0;
-            if (preferResponse && canWriteWithResponse)
-                return write.WriteValueWithResponseAsync(value);
-            if (canWriteWithoutResponse)
-                return write.WriteValueWithoutResponseAsync(value);
-            if (canWriteWithResponse)
-                return write.WriteValueWithResponseAsync(value);
-            throw new InvalidOperationException("FE-C characteristic does not support writes.");
+            // Android can report a write as busy after a preceding write-without-response.
+            // Retry only that explicit rejection, which means the write was not queued.
+            for (int attempt = 0; ; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                try
+                {
+                    bool canWriteWithResponse = (write.Properties & GattCharacteristicProperties.Write) != 0;
+                    bool canWriteWithoutResponse = (write.Properties & GattCharacteristicProperties.WriteWithoutResponse) != 0;
+                    if (preferResponse && canWriteWithResponse)
+                        await write.WriteValueWithResponseAsync(value);
+                    else if (canWriteWithoutResponse)
+                        await write.WriteValueWithoutResponseAsync(value);
+                    else if (canWriteWithResponse)
+                        await write.WriteValueWithResponseAsync(value);
+                    else
+                        throw new InvalidOperationException("FE-C characteristic does not support writes.");
+                    return;
+                }
+                catch (GattWriteRequestBusyException) when (attempt < 10)
+                {
+                    await Task.Delay(200, token);
+                }
+            }
         }
 
         private static string FecStatusText(byte status) => status switch
@@ -625,12 +649,18 @@ namespace ErgTrainer.Sensors
 
             // Command Status page 71: last command, sequence, result, then four data bytes.
             byte[]? data = e.Value;
-            if (data is { Length: > 4 } && data[4] == 0x47)
-                Debug.WriteLine($"[Tacx] FE-C page 71 received: {Convert.ToHexString(data)}; expected command 0x{_pendingFecPage:X2}");
+            if (data != null && _pendingFecPage is byte expectedPage)
+                LogControl($"FE-C notification: {Convert.ToHexString(data)}; expected status for 0x{expectedPage:X2}");
             if (_pendingFecPage is byte page && FecSimulationPackets.TryReadCommandStatus(data, page, out byte status))
             {
                 _pendingFecStatus?.TrySetResult(status);
             }
+        }
+
+        private void LogControl(string message)
+        {
+            Debug.WriteLine("[Tacx] " + message);
+            ControlDiagnostic?.Invoke(message);
         }
 
         private async Task DiscoverOtherCharacteristicsAsync(RemoteGattServer gatt, CancellationToken token)

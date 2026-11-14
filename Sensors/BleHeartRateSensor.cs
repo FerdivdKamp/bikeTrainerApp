@@ -32,6 +32,7 @@ namespace ErgTrainer.Sensors
         private GattService? _hrService;
         private GattCharacteristic? _hrCharacteristic;
         private CancellationTokenSource? _pollingCts;
+        private long _lastNotificationTimestamp;
 
         public async Task<bool> ConnectAsync(CancellationToken cancellationToken = default)
         {
@@ -216,20 +217,29 @@ namespace ErgTrainer.Sensors
             }
 
             Debug.WriteLine("[BLE] Starting notifications (if supported)...");
+            bool notificationsStarted = false;
+            _hrCharacteristic.CharacteristicValueChanged += HrCharacteristic_ValueChanged;
+            Volatile.Write(ref _lastNotificationTimestamp, Stopwatch.GetTimestamp());
             try
             {
                 await _hrCharacteristic.StartNotificationsAsync();
-                _hrCharacteristic.CharacteristicValueChanged += HrCharacteristic_ValueChanged;
+                notificationsStarted = true;
                 Debug.WriteLine("[BLE] Notifications started.");
             }
             catch (Exception ex)
             {
+                _hrCharacteristic.CharacteristicValueChanged -= HrCharacteristic_ValueChanged;
                 Debug.WriteLine($"[BLE] StartNotificationsAsync failed (ignored): {ex.Message}");
             }
 
-            Debug.WriteLine("[BLE] Starting polling loop…");
-            _pollingCts = new CancellationTokenSource();
-            _ = Task.Run(() => PollLoopAsync(_pollingCts.Token), _pollingCts.Token);
+            if ((_hrCharacteristic.Properties & GattCharacteristicProperties.Read) != 0)
+            {
+                var pollingCts = new CancellationTokenSource();
+                _pollingCts = pollingCts;
+                var characteristic = _hrCharacteristic;
+                _ = PollLoopAsync(characteristic, notificationsStarted, pollingCts.Token)
+                    .ContinueWith(_ => pollingCts.Dispose(), TaskScheduler.Default);
+            }
 
             Debug.WriteLine("[BLE] ConnectToDeviceAsync: success");
             return true;
@@ -271,18 +281,18 @@ namespace ErgTrainer.Sensors
             _device = null;
         }
 
-        private async Task PollLoopAsync(CancellationToken token)
+        private async Task PollLoopAsync(GattCharacteristic characteristic, bool notificationsStarted, CancellationToken token)
         {
-            if (_hrCharacteristic == null)
-                return;
-
             while (!token.IsCancellationRequested)
             {
                 try
                 {
-                    byte[] data = await _hrCharacteristic.ReadValueAsync();
-
-                    ProcessHeartRateData(data, "poll");
+                    var sinceNotification = Stopwatch.GetElapsedTime(Volatile.Read(ref _lastNotificationTimestamp));
+                    if (!notificationsStarted || sinceNotification >= TimeSpan.FromSeconds(5))
+                    {
+                        byte[] data = await characteristic.ReadValueAsync();
+                        if (!token.IsCancellationRequested) ProcessHeartRateData(data, "poll");
+                    }
                 }
                 catch (OperationCanceledException)
                 {
@@ -308,6 +318,7 @@ namespace ErgTrainer.Sensors
         {
             if (e.Value is byte[] data)
             {
+                Volatile.Write(ref _lastNotificationTimestamp, Stopwatch.GetTimestamp());
                 ProcessHeartRateData(data, "notification");
             }
         }

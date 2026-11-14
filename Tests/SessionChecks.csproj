@@ -8,6 +8,7 @@
     <PackageReference Include="Garmin.FIT.Sdk" Version="21.218.0" />
     <Compile Include="..\Sessions\TrainingSession.cs" Link="TrainingSession.cs" />
     <Compile Include="..\Sessions\SessionClock.cs" Link="SessionClock.cs" />
+    <Compile Include="..\Sessions\DurationExpression.cs" Link="DurationExpression.cs" />
     <Compile Include="..\Sensors\FecSimulationPackets.cs" Link="FecSimulationPackets.cs" />
     <Compile Include="..\Recorders\ActivityRecorder.cs" Link="ActivityRecorder.cs" />
     <Compile Include="..\Recorders\FitActivityExporter.cs" Link="FitActivityExporter.cs" />
