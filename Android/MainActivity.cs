@@ -14,7 +14,7 @@ using OperationCanceledException = System.OperationCanceledException;
 namespace ErgTrainer.AndroidApp;
 
 [Activity(Label = "ErgTrainer", MainLauncher = true, Exported = true)]
-public class MainActivity : Activity
+public partial class MainActivity : Activity
 {
     private readonly BleTacxTrainer trainer = new();
     private readonly BleHeartRateSensor heartRate = new();
@@ -28,34 +28,47 @@ public class MainActivity : Activity
     private Button sound = null!;
     private bool busy;
     private bool destroyed;
+    private BluetoothDevice? connectedTrainer;
+    private BluetoothDevice? connectedHeartRate;
+    private TrainerData? latestTrainerData;
+    private int? latestHeartRate;
 
     protected override void OnCreate(Bundle? savedInstanceState)
     {
         base.OnCreate(savedInstanceState);
+        pendingExport = savedInstanceState?.GetString("pendingExport");
         Window?.AddFlags(WindowManagerFlags.KeepScreenOn);
-        var layout = new LinearLayout(this) { Orientation = global::Android.Widget.Orientation.Vertical };
-        layout.SetPadding(32, 32, 32, 32);
+        var root = new LinearLayout(this) { Orientation = global::Android.Widget.Orientation.Vertical };
+        var navigation = new LinearLayout(this) { Orientation = global::Android.Widget.Orientation.Horizontal };
+        content = new LinearLayout(this) { Orientation = global::Android.Widget.Orientation.Vertical };
+        content.SetPadding(32, 16, 32, 32);
         status = new TextView(this) { Text = "Scan for your trainer and heart-rate monitor.", TextSize = 16 };
         readings = new TextView(this) { Text = "Power: -- W\nCadence: -- rpm\nSpeed: -- km/h\nHeart rate: -- bpm", TextSize = 22 };
         scan = MakeButton("Scan for devices", async () => await ScanAsync());
         connectTrainer = MakeButton("Choose trainer", () => ChooseDevice(true));
         connectHeartRate = MakeButton("Choose heart-rate monitor", () => ChooseDevice(false));
         sound = MakeButton("Test countdown sound", async () => await PlaySoundAsync());
-        layout.AddView(status);
-        layout.AddView(scan);
-        layout.AddView(connectTrainer);
-        layout.AddView(connectHeartRate);
-        layout.AddView(readings);
-        layout.AddView(sound);
         var scroll = new ScrollView(this);
-        scroll.SetFitsSystemWindows(true);
+        scroll.AddView(content);
+        root.AddView(navigation);
+        root.AddView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        foreach (var page in new[] { "Connect", "Test", "Create", "Session" })
+        {
+            var button = new Button(this) { Text = page };
+            button.SetAllCaps(false);
+            button.Click += (_, _) => ShowPage(page);
+            navigation.AddView(button, new LinearLayout.LayoutParams(0, -2, 1));
+        }
+        // The navigation and content must both be below the system bars.
+        root.SetFitsSystemWindows(true);
         if (OperatingSystem.IsAndroidVersionAtLeast(30))
-            scroll.SetOnApplyWindowInsetsListener(new SystemBarInsetsListener());
-        scroll.AddView(layout);
-        SetContentView(scroll);
+            root.SetOnApplyWindowInsetsListener(new SystemBarInsetsListener());
+        SetContentView(root);
         trainer.DataUpdated += TrainerDataUpdated;
+        trainer.ControlDiagnostic += TrainerControlDiagnostic;
         heartRate.HeartRateReceived += HeartRateReceived;
         UpdateButtons();
+        ShowPage("Connect");
     }
 
     private sealed class SystemBarInsetsListener : Java.Lang.Object, View.IOnApplyWindowInsetsListener
@@ -115,7 +128,11 @@ public class MainActivity : Activity
                     : $"Found {devices.Count} devices. Choose a trainer or heart-rate monitor.";
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { if (!destroyed) status.Text = $"Scan failed: {ex.Message}"; }
+        catch (Exception ex)
+        {
+            global::Android.Util.Log.Error("ErgTrainer", $"Scan failed: {ex}");
+            if (!destroyed) status.Text = $"Scan failed: {ex.Message}";
+        }
         finally { busy = false; if (!destroyed) UpdateButtons(); }
     }
 
@@ -132,13 +149,29 @@ public class MainActivity : Activity
 
     private async Task ConnectAsync(BluetoothDevice device, bool isTrainer)
     {
+        if (sessionClock.IsActive || sessionStarting || sessionCommandPending)
+        {
+            status.Text = "Stop the active session before changing devices.";
+            return;
+        }
         busy = true;
         UpdateButtons();
         status.Text = $"Connecting to {device.Name ?? "device"}…";
         try
         {
-            if (isTrainer) await trainer.DisconnectAsync();
-            else await heartRate.DisconnectAsync();
+            global::Android.Util.Log.Info("ErgTrainer", $"Connecting {(isTrainer ? "trainer" : "heart-rate monitor")}.");
+            if (isTrainer)
+            {
+                if (connectedTrainer != null) connectedTrainer.GattServerDisconnected -= TrainerDisconnected;
+                connectedTrainer = null;
+                await trainer.DisconnectAsync();
+            }
+            else
+            {
+                if (connectedHeartRate != null) connectedHeartRate.GattServerDisconnected -= HeartRateDisconnected;
+                connectedHeartRate = null;
+                await heartRate.DisconnectAsync();
+            }
             bool connected = isTrainer
                 ? await trainer.ConnectToDeviceAsync(device, lifetime.Token)
                 : await heartRate.ConnectToDeviceAsync(device, lifetime.Token);
@@ -147,13 +180,25 @@ public class MainActivity : Activity
                 if (isTrainer) await trainer.DisconnectAsync();
                 else await heartRate.DisconnectAsync();
             }
+            else if (isTrainer)
+            {
+                connectedTrainer = device;
+                device.GattServerDisconnected += TrainerDisconnected;
+            }
+            else
+            {
+                connectedHeartRate = device;
+                device.GattServerDisconnected += HeartRateDisconnected;
+            }
             if (!destroyed) status.Text = connected
                 ? $"Connected {(isTrainer ? "trainer" : "heart-rate monitor")}: {device.Name}"
                 : "Connection failed. Check that the correct device is awake and try again.";
+            global::Android.Util.Log.Info("ErgTrainer", $"{(isTrainer ? "Trainer" : "Heart-rate monitor")} connection result: {connected}.");
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
+            global::Android.Util.Log.Error("ErgTrainer", $"Connection failed: {ex}");
             if (!destroyed) status.Text = $"Connection failed: {ex.Message}";
             if (isTrainer) await trainer.DisconnectAsync();
             else await heartRate.DisconnectAsync();
@@ -171,7 +216,9 @@ public class MainActivity : Activity
         {
             if (destroyed) return;
             trainerReading = $"Power: {data.PowerWatts:F0} W\nCadence: {data.CadenceRpm?.ToString("F0") ?? "--"} rpm\nSpeed: {data.SpeedKph?.ToString("F1") ?? "--"} km/h";
+            latestTrainerData = data;
             readings.Text = trainerReading + "\n" + heartReading;
+            RefreshSessionDisplay();
         });
     }
 
@@ -182,7 +229,9 @@ public class MainActivity : Activity
         {
             if (destroyed) return;
             heartReading = $"Heart rate: {bpm} bpm";
+            latestHeartRate = bpm;
             readings.Text = trainerReading + "\n" + heartReading;
+            RefreshSessionDisplay();
         });
     }
 
@@ -237,15 +286,29 @@ public class MainActivity : Activity
     {
         destroyed = true;
         lifetime.Cancel();
+        if (connectedTrainer != null) connectedTrainer.GattServerDisconnected -= TrainerDisconnected;
+        if (connectedHeartRate != null) connectedHeartRate.GattServerDisconnected -= HeartRateDisconnected;
         trainer.DataUpdated -= TrainerDataUpdated;
+        trainer.ControlDiagnostic -= TrainerControlDiagnostic;
         heartRate.HeartRateReceived -= HeartRateReceived;
+        base.OnDestroy();
         try
         {
+            if (sessionClock.IsActive || sessionStarting || recording != null)
+                await StopSessionAsync("App closed.");
             await trainer.DisconnectAsync();
             await heartRate.DisconnectAsync();
         }
         catch (Exception ex) { System.Diagnostics.Debug.WriteLine(ex); }
         finally { lifetime.Dispose(); }
-        base.OnDestroy();
+    }
+
+    protected override void OnPause()
+    {
+        if (sessionClock.IsRunning && !sessionCommandPending)
+            PauseOrResume();
+        else if ((sessionClock.IsActive && sessionCommandPending) || sessionStarting)
+            _ = StopSessionAsync("Session stopped because the app left the foreground.");
+        base.OnPause();
     }
 }

@@ -8,6 +8,14 @@ static void Check(bool condition, string message)
     if (!condition) throw new Exception(message);
 }
 
+Check(DurationExpression.TryParse("60 * 5", out int duration) && duration == 300,
+    "Duration multiplication failed.");
+Check(DurationExpression.TryParse("3600", out duration) && duration == 3600,
+    "Simple duration failed.");
+Check(!DurationExpression.TryParse("60**5", out _) && !DurationExpression.TryParse("0", out _) &&
+      !DurationExpression.TryParse("86400*2", out _) && !DurationExpression.TryParse("60/5", out _),
+    "Invalid duration expression accepted.");
+
 var erg = new TrainingSession { Name = "Intervals" };
 erg.Blocks.Add(new TrainingBlock { Name = "Easy", DurationSeconds = 60, TargetWatts = 100, Instruction = "Easy" });
 erg.Blocks.Add(new TrainingBlock { Name = "Hard", DurationSeconds = 10, TargetWatts = 300, Category = "sprint" });

@@ -14,5 +14,6 @@
   <ItemGroup>
     <PackageReference Include="InTheHand.BluetoothLE" Version="4.0.43" />
     <Compile Include="..\Sensors\*.cs" Link="Sensors\%(Filename)%(Extension)" />
+    <Compile Include="..\Sessions\*.cs" Link="Sessions\%(Filename)%(Extension)" />
   </ItemGroup>
 </Project>

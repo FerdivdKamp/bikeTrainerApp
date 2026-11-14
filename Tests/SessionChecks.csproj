@@ -7,6 +7,7 @@
   <ItemGroup>
     <Compile Include="..\Sessions\TrainingSession.cs" Link="TrainingSession.cs" />
     <Compile Include="..\Sessions\SessionClock.cs" Link="SessionClock.cs" />
+    <Compile Include="..\Sessions\DurationExpression.cs" Link="DurationExpression.cs" />
     <Compile Include="..\Sensors\FecSimulationPackets.cs" Link="FecSimulationPackets.cs" />
   </ItemGroup>
 </Project>
